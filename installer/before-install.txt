@@ -1,0 +1,11 @@
+Before you install
+
+If you are installing RescueForge to get deleted files back, do NOT install it on the drive that held those files. Installing writes new data, and new data can land on top of exactly the files you want to recover.
+
+  - Lost files were on another drive (D:, a USB stick, a memory card): go ahead.
+
+  - Lost files were on this Windows drive (usually C:): cancel this setup and
+    use the portable version instead. Unpack RescueForge-portable-x64.zip on a
+    USB stick using another computer, and run RescueForge.exe from the stick.
+
+RescueForge itself never writes to a drive it scans.

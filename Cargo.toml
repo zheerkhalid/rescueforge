@@ -1,0 +1,71 @@
+[package]
+name = "rescueforge"
+version = "1.0.0"
+edition = "2021"
+description = "File recovery for Windows: quick and deep scans for deleted files, lost partitions and disk images"
+authors = ["Zheer Khalid (https://zheer.dev)"]
+homepage = "https://zheer.dev"
+repository = "https://github.com/zheerkhalid/rescueforge"
+license = "MIT"
+
+[lib]
+name = "rescueforge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "RescueForge"
+path = "src/main.rs"
+# The binary carries a "highestAvailable" manifest; its (empty) test harness would
+# need elevation to start, so all tests live in the library and in tests/.
+test = false
+
+[dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["glow", "default_fonts"] }
+# Decoders are used for previews of found pictures; the encoders build test and demo data.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff", "ico"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Native open/save dialogs (uses the system dialogs, no extra runtime).
+rfd = { version = "0.15", default-features = false }
+# Inflate (to find where a gzip stream ends) and session file compression.
+miniz_oxide = "0.8"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+tiny-skia = "0.11"
+embed-resource = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# Unlike its siblings RescueForge keeps unwinding: scan and preview workers are
+# wrapped in catch_unwind so that a bug triggered by a corrupt disk structure
+# ends one task with an error message instead of closing the program.
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Optimised but quick to link: for taking screenshots and trying things out.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
