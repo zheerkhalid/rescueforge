@@ -352,7 +352,7 @@ impl App {
                                                     ui.label(RichText::new("•").color(color));
                                                     ui.vertical(|ui| {
                                                         ui.spacing_mut().item_spacing.y = 0.0;
-                                                        ui.add(egui::Label::new(RichText::new(&item.name).font(semibold(13.5))).truncate());
+                                                        widgets::name_label(ui, &item.name, 13.5, false);
                                                         ui.add(egui::Label::new(RichText::new(why).size(12.5).color(p.muted)).wrap());
                                                     });
                                                 });

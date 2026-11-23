@@ -9,7 +9,7 @@ use crate::model::{Chance, FoundFile, Origin, SourceSpec, Status};
 use crate::recover::{judge, recover, RecoverOptions, Verdict};
 use crate::scan::{run_collect, ScanOptions};
 use crate::session::Session;
-use crate::source::{open_image, FlakySource, Source};
+use crate::source::{open_image, FlakySource, Source, StopAt};
 use crate::testimg::{self, sample_tree, samples, Reuse, Tree};
 use crate::util::{crc32, fmt_size};
 use std::path::{Path, PathBuf};
@@ -282,6 +282,7 @@ fn run_in(base: &Path) -> Result<Vec<String>, String> {
     let src = ntfs_source.ok_or("FAILED: no NTFS source")?;
     let (files, scan_log) = run_collect(&src, &quick);
     let session = Session {
+        resume: None,
         created: 1_760_000_000,
         source: SourceSpec::Image {
             path: base.join("NTFS.img").to_string_lossy().into_owned(),
@@ -332,6 +333,96 @@ fn run_in(base: &Path) -> Result<Vec<String>, String> {
     log.push(format!(
         "Imaging: a drive with {} of unreadable sectors copied to an image (zeros in their place), the image scanned, {n} files recovered and identical",
         fmt_size(report.bad_bytes)
+    ));
+
+    // 6b. A deep scan of an image file is stopped part way, saved to a
+    // session file, and continued from there.
+    let mut big = testimg::ntfs::build(&tree, 24 << 20);
+    for (i, at) in [13usize << 20, 18 << 20, 22 << 20].into_iter().enumerate() {
+        let data = samples::jpeg(40 + i as u64, 320, 240);
+        check(big[at..at + data.len()].iter().all(|b| *b == 0), || {
+            format!("the test image has no free space at {at}")
+        })?;
+        big[at..at + data.len()].copy_from_slice(&data);
+    }
+    let big_path = base.join("stop-and-continue.img");
+    std::fs::write(&big_path, &big).map_err(|e| e.to_string())?;
+    let big_crc = crc32(&big);
+    let big_src = open_image(&big_path)?;
+    let deep_opts = ScanOptions {
+        deep: true,
+        ..Default::default()
+    };
+    let (whole, _) = run_collect(&big_src, &deep_opts);
+    let ctl = Arc::new(Control::new());
+    let stopper = Source::new(Arc::new(StopAt {
+        inner: big_src.clone(),
+        at: 8 << 20,
+        ctl: ctl.clone(),
+    }));
+    let progress = Progress::new();
+    let mut first: Vec<FoundFile> = Vec::new();
+    crate::scan::run(&stopper, &deep_opts, &ctl, &progress, &mut |m| {
+        if let crate::scan::ScanMsg::Files(f) = m {
+            first.extend(f);
+        }
+    });
+    let point = progress
+        .resume()
+        .ok_or("FAILED: the stopped scan left no place to continue from")?;
+    check(point.pos == 12 << 20 && first.len() < whole.len(), || {
+        format!(
+            "stopped at {point:?} with {} of {} files",
+            first.len(),
+            whole.len()
+        )
+    })?;
+    let stopped_session = Session {
+        created: 1_760_000_000,
+        source: SourceSpec::Image {
+            path: big_path.to_string_lossy().into_owned(),
+        },
+        source_label: "stop-and-continue.img".to_string(),
+        source_len: big_src.len(),
+        options: deep_opts.clone(),
+        finished: false,
+        files: first,
+        log: Vec::new(),
+        resume: Some(point),
+    };
+    let stopped_path = base.join("stopped.rfsession");
+    stopped_session.save(&stopped_path)?;
+    let reopened = Session::load(&stopped_path)?;
+    let (rest, rest_log) = run_collect(
+        &big_src,
+        &ScanOptions {
+            resume: reopened.resume.clone(),
+            ..deep_opts.clone()
+        },
+    );
+    let key = |f: &FoundFile| (f.path.clone(), f.name.clone(), f.size, f.first_offset());
+    let mut both: Vec<_> = reopened.files.iter().chain(&rest).map(key).collect();
+    both.sort();
+    let mut expected: Vec<_> = whole.iter().map(key).collect();
+    expected.sort();
+    check(both == expected && !rest.is_empty(), || {
+        format!(
+            "stopped ({}) + continued ({}) differs from one whole scan ({}). Log: {rest_log:#?}",
+            reopened.files.len(),
+            rest.len(),
+            whole.len()
+        )
+    })?;
+    check(
+        std::fs::read(&big_path).map(|b| crc32(&b)).ok() == Some(big_crc),
+        || "the image was changed by stopping and continuing a scan".to_string(),
+    )?;
+    log.push(format!(
+        "Stop and continue: a deep scan stopped at 12.0 MB of {} with {} files, saved to a session, continued from there and found the other {}; together exactly the {} files of an uninterrupted scan, nothing listed twice",
+        fmt_size(big_src.len()),
+        reopened.files.len(),
+        rest.len(),
+        whole.len()
     ));
 
     // 7. The guard against recovering onto the scanned drive.

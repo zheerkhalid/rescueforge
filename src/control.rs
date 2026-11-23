@@ -1,6 +1,7 @@
 //! Pause / stop switches and progress counters shared between a worker
 //! thread and the window.
 
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -42,6 +43,21 @@ impl Control {
     }
 }
 
+/// Where a deep scan had got to when it was stopped: enough to pick the
+/// sector-by-sector pass up again at the same place.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResumePoint {
+    /// Everything before this byte has been read.
+    pub pos: u64,
+    /// A file found earlier reaches up to here: nothing starts inside it.
+    pub skip_until: u64,
+    /// Where the lost partitions found so far start (they are not listed again).
+    pub lost: Vec<u64>,
+    /// How many files were listed so far.
+    pub listed: u64,
+}
+
 #[derive(Default)]
 pub struct Progress {
     pub done: AtomicU64,
@@ -49,6 +65,7 @@ pub struct Progress {
     /// Files found (scan) or files finished (recovery).
     pub found: AtomicU64,
     phase: Mutex<String>,
+    resume: Mutex<Option<ResumePoint>>,
 }
 
 impl Progress {
@@ -67,6 +84,19 @@ impl Progress {
 
     pub fn phase(&self) -> String {
         self.phase.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Notes how far the deep scan has come (`None`: it ran to the end).
+    pub fn set_resume(&self, point: Option<ResumePoint>) {
+        *self.resume.lock().unwrap_or_else(|e| e.into_inner()) = point;
+    }
+
+    /// Where a stopped deep scan can be continued, if it can.
+    pub fn resume(&self) -> Option<ResumePoint> {
+        self.resume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn fraction(&self) -> f32 {
@@ -110,5 +140,19 @@ mod tests {
         assert_eq!(p.fraction(), 1.0);
         p.set_phase("Reading");
         assert_eq!(p.phase(), "Reading");
+        assert_eq!(p.resume(), None);
+        let point = ResumePoint {
+            pos: 8 << 20,
+            skip_until: 9 << 20,
+            lost: vec![1 << 20],
+            listed: 12,
+        };
+        p.set_resume(Some(point.clone()));
+        assert_eq!(p.resume(), Some(point));
+        p.set_resume(None);
+        assert_eq!(p.resume(), None);
+        // Session files written before this field existed still load.
+        let old: ResumePoint = serde_json::from_str("{\"pos\":4096}").unwrap();
+        assert_eq!((old.pos, old.skip_until, old.listed), (4096, 0, 0));
     }
 }

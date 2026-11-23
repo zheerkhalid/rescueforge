@@ -2,7 +2,7 @@
 //! thumbnail grid, the preview panel and the selection bar.
 
 use super::app::{App, Tab};
-use super::state::{ChanceFilter, Col, DateFilter, Session, SizeFilter};
+use super::state::{scroll_into_view, ChanceFilter, Col, DateFilter, Session, SizeFilter};
 use super::theme::{pal, regular, semibold, Icon, Palette};
 use super::widgets;
 use crate::model::{Category, Chance, Status};
@@ -50,6 +50,69 @@ fn paint_fitted(ui: &Ui, rect: Rect, tex: &TextureHandle) {
         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
         Color32::WHITE,
     );
+}
+
+/// Height of one line of the file list and of one row of tiles.
+pub(super) const LIST_ROW: f32 = 36.0;
+pub(super) const TILE_ROW: f32 = 162.0;
+
+/// What was chosen in the right-click menu of a file.
+enum RowAction {
+    Recover(u32),
+    Preview(u32),
+    Toggle(u32),
+    TickType(String),
+    TickFolder(u32),
+    Copy(String),
+}
+
+/// The right-click menu of a file in the list or the grid.
+fn row_menu(ui: &mut Ui, ses: &Session, i: u32) -> Option<RowAction> {
+    let f = &ses.files[i as usize];
+    let ext = f.ext();
+    let mut action = None;
+    ui.set_min_width(230.0);
+    if ui
+        .add_enabled(
+            ses.source.is_some(),
+            egui::Button::new(Icon::RECOVER.with("Recover this file...")),
+        )
+        .clicked()
+    {
+        action = Some(RowAction::Recover(i));
+    }
+    if ui
+        .button(Icon::VIEW.with("Open the large preview"))
+        .clicked()
+    {
+        action = Some(RowAction::Preview(i));
+    }
+    ui.separator();
+    let tick = if ses.checked[i as usize] {
+        "Untick this file"
+    } else {
+        "Tick this file"
+    };
+    if ui.button(tick).clicked() {
+        action = Some(RowAction::Toggle(i));
+    }
+    if !ext.is_empty() && ui.button(format!("Tick all .{ext} files shown")).clicked() {
+        action = Some(RowAction::TickType(ext));
+    }
+    if ui.button("Tick everything in its folder").clicked() {
+        action = Some(RowAction::TickFolder(ses.dir_of[i as usize]));
+    }
+    ui.separator();
+    if ui.button(Icon::COPY.with("Copy the name")).clicked() {
+        action = Some(RowAction::Copy(f.name.clone()));
+    }
+    if ui.button("Copy the original path").clicked() {
+        action = Some(RowAction::Copy(crate::fs::join(&f.path, &f.name)));
+    }
+    if action.is_some() {
+        ui.close_menu();
+    }
+    action
 }
 
 struct Columns {
@@ -139,10 +202,26 @@ impl App {
             fmt_count(ses.files.len() as u64),
             fmt_count(ses.visible.len() as u64)
         );
-        let (mut save, mut new_scan) = (false, false);
+        let (mut save, mut new_scan, mut export, mut resume) = (false, false, false, false);
         Self::page_header(ui, &ses.label, &subtitle, |ui| {
             if widgets::ghost_button(ui, &Icon::SCAN.with("New scan")).clicked() {
                 new_scan = true;
+            }
+            // With the preview panel open there is only room for two labelled buttons.
+            let export_tip = "Save the list as a table (CSV) for a spreadsheet: the ticked files, or everything shown (Ctrl+E)";
+            if ui.available_width() < 250.0 {
+                if widgets::icon_button(ui, Icon::LIST, export_tip).clicked() {
+                    export = !ses.files.is_empty();
+                }
+            } else if widgets::ghost_button_enabled(
+                ui,
+                &Icon::LIST.with("Export list"),
+                !ses.files.is_empty(),
+            )
+            .on_hover_text(export_tip)
+            .clicked()
+            {
+                export = true;
             }
             if widgets::ghost_button(ui, &Icon::SAVE.with("Save scan")).on_hover_text("Save the list to a session file and open it later without scanning again (Ctrl+S)").clicked() {
                 save = true;
@@ -150,6 +229,49 @@ impl App {
         });
         if scanning {
             self.progress_card(ui, &mut ses);
+            ui.add_space(2.0);
+        } else if let Some(point) = ses.resume.as_ref().filter(|_| ses.stopped) {
+            // A deep scan that was stopped early can go on where it was.
+            let real = ses
+                .source
+                .as_ref()
+                .map(|s| s.len())
+                .unwrap_or(ses.source_len);
+            let done = if real == 0 {
+                0.0
+            } else {
+                (point.pos as f64 / real as f64).clamp(0.0, 1.0)
+            };
+            let left = ((1.0 - done) * ses.source_len as f64) as u64;
+            let ready = ses.source.is_some();
+            widgets::card(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), 34.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.label(RichText::new(Icon::PAUSE.glyph()).size(16.0).color(p.accent));
+                        ui.label(
+                            RichText::new(format!("The deep scan was stopped at {:.0}%", done * 100.0))
+                                .font(semibold(15.0)),
+                        );
+                        if ui.available_width() > 420.0 {
+                            ui.label(
+                                RichText::new(format!("{} still to read", fmt_size(left)))
+                                    .color(p.muted),
+                            );
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if widgets::primary_button(ui, &Icon::PLAY.with("Continue scan"), ready)
+                                .on_hover_text("Go on where the scan was stopped. The files listed so far, and your ticks, are kept.")
+                                .on_disabled_hover_text("Connect the drive this scan was made of and open the session again.")
+                                .clicked()
+                            {
+                                resume = true;
+                            }
+                        });
+                    },
+                );
+            });
             ui.add_space(2.0);
         }
         if !ses.source_note.is_empty() {
@@ -161,6 +283,7 @@ impl App {
 
         let height = ui.available_height();
         let tree_w = 236.0;
+        let mut action: Option<RowAction> = None;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             ui.allocate_ui_with_layout(vec2(tree_w, height), Layout::top_down(Align::Min), |ui| {
@@ -168,13 +291,26 @@ impl App {
             });
             let rest = ui.available_width();
             ui.allocate_ui_with_layout(vec2(rest, height), Layout::top_down(Align::Min), |ui| {
-                if ses.grid {
-                    self.grid_card(ui, &mut ses, height);
+                action = if ses.grid {
+                    self.grid_card(ui, &mut ses, height)
                 } else {
-                    self.table_card(ui, &mut ses, height);
-                }
+                    self.table_card(ui, &mut ses, height)
+                };
             });
         });
+        let mut recover_one = None;
+        match action {
+            Some(RowAction::Recover(i)) => recover_one = Some(i),
+            Some(RowAction::Preview(i)) => {
+                ses.highlighted = Some(i);
+                self.big_preview = true;
+            }
+            Some(RowAction::Toggle(i)) => ses.toggle(i),
+            Some(RowAction::TickType(ext)) => ses.set_ext(&ext, true),
+            Some(RowAction::TickFolder(dir)) => ses.set_folder(dir, true),
+            Some(RowAction::Copy(text)) => ui.ctx().copy_text(text),
+            None => {}
+        }
 
         // Keep the preview in step with the highlighted row.
         if let Some(h) = ses.highlighted {
@@ -187,6 +323,15 @@ impl App {
         self.ses = Some(ses);
         if save {
             self.save_session();
+        }
+        if export {
+            self.export_list();
+        }
+        if resume {
+            self.continue_scan(ui.ctx());
+        }
+        if let Some(i) = recover_one {
+            self.open_recover_dialog(Some(i));
         }
         if new_scan {
             self.tab = Tab::Recover;
@@ -325,6 +470,22 @@ impl App {
                     {
                         ses.show_existing = existing;
                         changed = true;
+                    }
+                }
+                if ses.filters_active() {
+                    let tip = "Show all types, sizes, dates and ratings again";
+                    let room = ui.available_width();
+                    // Beside an open preview panel only the small button fits.
+                    let clicked = if room > 290.0 {
+                        widgets::ghost_button(ui, &Icon::CLOSE.with("Clear filters"))
+                            .on_hover_text(tip)
+                            .clicked()
+                    } else {
+                        room > 200.0
+                            && widgets::icon_button(ui, Icon::CLOSE, "Clear filters").clicked()
+                    };
+                    if clicked {
+                        ses.clear_filters();
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -504,8 +665,10 @@ impl App {
         }
     }
 
-    fn empty_list(&self, ui: &mut Ui, ses: &Session) {
+    /// Returns `true` when "Show everything" was pressed.
+    fn empty_list(&self, ui: &mut Ui, ses: &Session) -> bool {
         let p = pal(ui);
+        let mut show_all = false;
         if ses.scanning() && ses.files.is_empty() {
             widgets::busy_state(
                 ui,
@@ -530,15 +693,27 @@ impl App {
                 Icon::FILTER,
                 p.muted,
                 "No files match",
-                "Nothing passes the current search and filters. Try \"All\", another folder, or clear the search.",
+                "Nothing passes the current search and filters. Try another folder, or show everything again.",
             );
+            ui.vertical_centered(|ui| {
+                if widgets::primary_button(ui, "Show everything", true)
+                    .on_hover_text("Clear the search and all filters and go back to the top folder")
+                    .clicked()
+                {
+                    show_all = true;
+                }
+            });
         }
+        show_all
     }
 
-    fn table_card(&mut self, ui: &mut Ui, ses: &mut Session, height: f32) {
+    fn table_card(&mut self, ui: &mut Ui, ses: &mut Session, height: f32) -> Option<RowAction> {
         let p = pal(ui);
-        const ROW: f32 = 36.0;
+        const ROW: f32 = LIST_ROW;
         let tz = self.tz;
+        let mut action: Option<RowAction> = None;
+        let mut show_all = false;
+        let mut view: Option<(f32, f32)> = None;
         let mut toggle: Option<u32> = None;
         let mut highlight: Option<u32> = None;
         let mut open_big = false;
@@ -616,126 +791,138 @@ impl App {
                 }
 
                 if ses.visible.is_empty() {
-                    self.empty_list(ui, ses);
+                    show_all = self.empty_list(ui, ses);
                     return;
                 }
                 ui.spacing_mut().item_spacing.y = 0.0;
-                egui::ScrollArea::vertical()
+                let mut area = egui::ScrollArea::vertical()
                     .id_salt("table")
-                    .auto_shrink([false, false])
-                    .show_rows(ui, ROW, ses.visible.len(), |ui, range| {
-                        for row in range {
-                            let i = ses.visible[row];
-                            let f = &ses.files[i as usize];
-                            let (rect, resp) =
-                                ui.allocate_exact_size(vec2(width, ROW), Sense::click());
-                            let active = ses.highlighted == Some(i);
-                            if active {
-                                ui.painter().rect_filled(
-                                    rect.shrink2(vec2(0.0, 1.0)),
-                                    CornerRadius::same(8),
-                                    p.selected,
-                                );
-                            } else if resp.hovered() {
-                                ui.painter().rect_filled(
-                                    rect.shrink2(vec2(0.0, 1.0)),
-                                    CornerRadius::same(8),
-                                    p.hover,
-                                );
-                            }
-                            let r = Rect::from_min_size(
-                                pos2(rect.left() + 8.0, rect.top()),
-                                vec2(24.0, ROW),
+                    .auto_shrink([false, false]);
+                // The keyboard moved the highlight: keep it in sight.
+                if std::mem::take(&mut ses.scroll_to_highlight) {
+                    if let Some(to) = ses.highlighted_row().and_then(|row| {
+                        scroll_into_view(row as f32 * ROW, ROW, ses.list_view.0, ses.list_view.1)
+                    }) {
+                        area = area.vertical_scroll_offset(to);
+                    }
+                }
+                let out = area.show_rows(ui, ROW, ses.visible.len(), |ui, range| {
+                    for row in range {
+                        let i = ses.visible[row];
+                        let f = &ses.files[i as usize];
+                        let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW), Sense::click());
+                        let active = ses.highlighted == Some(i);
+                        if active {
+                            ui.painter().rect_filled(
+                                rect.shrink2(vec2(0.0, 1.0)),
+                                CornerRadius::same(8),
+                                p.selected,
                             );
-                            let cresp =
-                                ui.interact(r, ui.id().with(("row-check", i)), Sense::click());
-                            widgets::paint_checkbox(
-                                ui,
-                                r,
-                                Some(ses.checked[i as usize]),
-                                cresp.hovered(),
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(
+                                rect.shrink2(vec2(0.0, 1.0)),
+                                CornerRadius::same(8),
+                                p.hover,
                             );
-                            if cresp.clicked() {
-                                toggle = Some(i);
-                            }
-                            let cell = |(x, w): (f32, f32)| {
-                                Rect::from_min_max(
-                                    pos2(x, rect.top()),
-                                    pos2(x + w - 12.0, rect.bottom()),
-                                )
-                            };
-                            // Name with a type icon.
-                            let (icon, color) = category_look(&p, f.category());
-                            let name_cell = cell(cols.name);
-                            ui.painter().text(
-                                pos2(name_cell.left() + 9.0, rect.center().y),
-                                Align2::CENTER_CENTER,
-                                icon.glyph(),
-                                regular(15.0),
-                                color,
-                            );
-                            let mut name_rect = name_cell;
-                            name_rect.min.x += 26.0;
-                            if f.status != Status::Deleted {
-                                let w = widgets::paint_badge(
-                                    ui,
-                                    Rect::from_min_size(
-                                        pos2(name_cell.right() - 62.0, rect.top()),
-                                        vec2(62.0, ROW),
-                                    ),
-                                    f.status.label(),
-                                    p.info,
-                                );
-                                name_rect.max.x = name_cell.right() - 62.0 - 6.0;
-                                let _ = w;
-                            }
-                            let cut =
-                                widgets::text_in(ui, name_rect, &f.name, regular(14.0), p.text);
-                            widgets::text_in_right(
-                                ui,
-                                cell(cols.size),
-                                &fmt_size(f.size),
-                                regular(13.0),
-                                p.muted,
-                            );
-                            if let Some(c) = cols.modified {
-                                let t = fmt_time(f.modified, tz);
-                                widgets::text_in(
-                                    ui,
-                                    cell(c),
-                                    if t.is_empty() { "Not known" } else { &t },
-                                    regular(13.0),
-                                    if t.is_empty() { p.faint } else { p.muted },
-                                );
-                            }
-                            let cc = cell(cols.chance);
-                            widgets::paint_badge(
-                                ui,
-                                cc,
-                                f.chance.label(),
-                                chance_color(&p, f.chance),
-                            );
-                            if let Some(c) = cols.folder {
-                                let path = if f.path.is_empty() {
-                                    "(top folder)"
-                                } else {
-                                    f.path.as_str()
-                                };
-                                widgets::text_in(ui, cell(c), path, regular(13.0), p.faint);
-                            }
-                            if cut {
-                                resp.clone().on_hover_text(&f.name);
-                            }
-                            if resp.clicked() {
-                                highlight = Some(i);
-                            }
-                            if resp.double_clicked() {
-                                highlight = Some(i);
-                                open_big = true;
-                            }
                         }
-                    });
+                        let r = Rect::from_min_size(
+                            pos2(rect.left() + 8.0, rect.top()),
+                            vec2(24.0, ROW),
+                        );
+                        let cresp = ui.interact(r, ui.id().with(("row-check", i)), Sense::click());
+                        widgets::paint_checkbox(
+                            ui,
+                            r,
+                            Some(ses.checked[i as usize]),
+                            cresp.hovered(),
+                        );
+                        if cresp.clicked() {
+                            toggle = Some(i);
+                        }
+                        let cell = |(x, w): (f32, f32)| {
+                            Rect::from_min_max(
+                                pos2(x, rect.top()),
+                                pos2(x + w - 12.0, rect.bottom()),
+                            )
+                        };
+                        // Name with a type icon.
+                        let (icon, color) = category_look(&p, f.category());
+                        let name_cell = cell(cols.name);
+                        ui.painter().text(
+                            pos2(name_cell.left() + 9.0, rect.center().y),
+                            Align2::CENTER_CENTER,
+                            icon.glyph(),
+                            regular(15.0),
+                            color,
+                        );
+                        let mut name_rect = name_cell;
+                        name_rect.min.x += 26.0;
+                        if f.status != Status::Deleted {
+                            let w = widgets::paint_badge(
+                                ui,
+                                Rect::from_min_size(
+                                    pos2(name_cell.right() - 62.0, rect.top()),
+                                    vec2(62.0, ROW),
+                                ),
+                                f.status.label(),
+                                p.info,
+                            );
+                            name_rect.max.x = name_cell.right() - 62.0 - 6.0;
+                            let _ = w;
+                        }
+                        let cut = widgets::text_in(ui, name_rect, &f.name, regular(14.0), p.text);
+                        widgets::text_in_right(
+                            ui,
+                            cell(cols.size),
+                            &fmt_size(f.size),
+                            regular(13.0),
+                            p.muted,
+                        );
+                        if let Some(c) = cols.modified {
+                            let t = fmt_time(f.modified, tz);
+                            widgets::text_in(
+                                ui,
+                                cell(c),
+                                if t.is_empty() { "Not known" } else { &t },
+                                regular(13.0),
+                                if t.is_empty() { p.faint } else { p.muted },
+                            );
+                        }
+                        let cc = cell(cols.chance);
+                        widgets::paint_badge(ui, cc, f.chance.label(), chance_color(&p, f.chance));
+                        if let Some(c) = cols.folder {
+                            let path = if f.path.is_empty() {
+                                "(top folder)"
+                            } else {
+                                f.path.as_str()
+                            };
+                            widgets::text_in(ui, cell(c), path, regular(13.0), p.faint);
+                        }
+                        if cut {
+                            resp.clone().on_hover_text(&f.name);
+                        }
+                        if resp.clicked() || resp.secondary_clicked() {
+                            highlight = Some(i);
+                        }
+                        if resp.double_clicked() {
+                            highlight = Some(i);
+                            open_big = true;
+                        }
+                        resp.context_menu(|ui| {
+                            if let Some(a) = row_menu(ui, ses, i) {
+                                action = Some(a);
+                            }
+                        });
+                    }
+                });
+                view = Some((out.state.offset.y, out.inner_rect.height()));
             });
+        if let Some(v) = view {
+            ses.list_view = v;
+        }
+        if show_all {
+            self.show_everything(ses);
+        }
         if let Some(col) = sort {
             ses.sort = if ses.sort.0 == col {
                 (col, !ses.sort.1)
@@ -756,13 +943,25 @@ impl App {
         if open_big {
             self.big_preview = true;
         }
+        action
     }
 
-    fn grid_card(&mut self, ui: &mut Ui, ses: &mut Session, height: f32) {
+    /// Back to the whole list: no search, no filters, the top folder.
+    fn show_everything(&mut self, ses: &mut Session) {
+        self.search.clear();
+        ses.set_search("");
+        ses.folder = 0;
+        ses.clear_filters();
+    }
+
+    fn grid_card(&mut self, ui: &mut Ui, ses: &mut Session, height: f32) -> Option<RowAction> {
         let p = pal(ui);
         const TILE_W: f32 = 150.0;
         const TILE_H: f32 = 152.0;
-        const GAP: f32 = 10.0;
+        const GAP: f32 = TILE_ROW - TILE_H;
+        let mut action: Option<RowAction> = None;
+        let mut show_all = false;
+        let mut view: Option<(f32, f32, usize)> = None;
         let thumbs_on = self.settings.thumbnails;
         let mut toggle: Option<u32> = None;
         let mut highlight: Option<u32> = None;
@@ -776,7 +975,7 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.set_height(height - 22.0);
                 if ses.visible.is_empty() {
-                    self.empty_list(ui, ses);
+                    show_all = self.empty_list(ui, ses);
                     return;
                 }
                 let width = ui.available_width();
@@ -784,124 +983,141 @@ impl App {
                 let tile_w = (width - GAP * (per_row as f32 - 1.0)) / per_row as f32;
                 let rows = ses.visible.len().div_ceil(per_row);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                egui::ScrollArea::vertical()
+                let mut area = egui::ScrollArea::vertical()
                     .id_salt("grid")
-                    .auto_shrink([false, false])
-                    .show_rows(ui, TILE_H + GAP, rows, |ui, range| {
-                        for row in range {
-                            let (line, _) =
-                                ui.allocate_exact_size(vec2(width, TILE_H + GAP), Sense::hover());
-                            for k in 0..per_row {
-                                let Some(&i) = ses.visible.get(row * per_row + k) else {
-                                    break;
-                                };
-                                let f = &ses.files[i as usize];
-                                let rect = Rect::from_min_size(
-                                    pos2(line.left() + k as f32 * (tile_w + GAP), line.top()),
-                                    vec2(tile_w, TILE_H),
-                                );
-                                let resp =
-                                    ui.interact(rect, ui.id().with(("tile", i)), Sense::click());
-                                let active = ses.highlighted == Some(i);
-                                ui.painter().rect_filled(
-                                    rect,
-                                    CornerRadius::same(10),
-                                    if active {
-                                        p.selected
-                                    } else if resp.hovered() {
-                                        p.hover
-                                    } else {
-                                        p.bg
-                                    },
-                                );
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    CornerRadius::same(10),
-                                    Stroke::new(1.0_f32, if active { p.accent } else { p.border }),
-                                    StrokeKind::Inside,
-                                );
-                                let picture = Rect::from_min_max(
-                                    rect.min + vec2(6.0, 6.0),
-                                    pos2(rect.right() - 6.0, rect.top() + 104.0),
-                                );
-                                let ext = f.ext();
-                                let wanted = thumbs_on
-                                    && crate::preview::is_picture(&ext)
-                                    && f.size <= crate::preview::MAX_PICTURE_BYTES;
-                                if wanted {
-                                    if let Some(src) = &ses.source {
-                                        self.previewer.want_thumb(i, f, src);
-                                    }
-                                }
-                                match self.previewer.thumbs.get(&i) {
-                                    Some(Some(tex)) if wanted => paint_fitted(ui, picture, tex),
-                                    _ => {
-                                        let (icon, color) = category_look(&p, f.category());
-                                        ui.painter().text(
-                                            picture.center(),
-                                            Align2::CENTER_CENTER,
-                                            icon.glyph(),
-                                            regular(34.0),
-                                            color.gamma_multiply(0.85),
-                                        );
-                                    }
-                                }
-                                widgets::text_in(
-                                    ui,
-                                    Rect::from_min_max(
-                                        pos2(rect.left() + 10.0, rect.top() + 106.0),
-                                        pos2(rect.right() - 8.0, rect.top() + 128.0),
-                                    ),
-                                    &f.name,
-                                    regular(13.0),
-                                    p.text,
-                                );
-                                let dot = pos2(rect.left() + 15.0, rect.top() + 138.0);
-                                ui.painter()
-                                    .circle_filled(dot, 4.0, chance_color(&p, f.chance));
-                                widgets::text_in(
-                                    ui,
-                                    Rect::from_min_max(
-                                        pos2(rect.left() + 25.0, rect.top() + 128.0),
-                                        pos2(rect.right() - 8.0, rect.top() + 148.0),
-                                    ),
-                                    &format!("{} · {}", fmt_size(f.size), f.chance.label()),
-                                    regular(11.5),
-                                    p.faint,
-                                );
-                                // Tick box on a small plate, top left.
-                                let plate = Rect::from_min_size(
-                                    rect.min + vec2(8.0, 8.0),
-                                    vec2(26.0, 26.0),
-                                );
-                                ui.painter().rect_filled(
-                                    plate,
-                                    CornerRadius::same(7),
-                                    p.card.gamma_multiply(0.92),
-                                );
-                                let cresp = ui.interact(
-                                    plate,
-                                    ui.id().with(("tile-check", i)),
-                                    Sense::click(),
-                                );
-                                widgets::paint_checkbox(
-                                    ui,
-                                    plate,
-                                    Some(ses.checked[i as usize]),
-                                    cresp.hovered(),
-                                );
-                                if cresp.clicked() {
-                                    toggle = Some(i);
-                                } else if resp.double_clicked() {
-                                    highlight = Some(i);
-                                    open_big = true;
-                                } else if resp.clicked() {
-                                    highlight = Some(i);
+                    .auto_shrink([false, false]);
+                if std::mem::take(&mut ses.scroll_to_highlight) {
+                    if let Some(to) = ses.highlighted_row().and_then(|at| {
+                        scroll_into_view(
+                            (at / per_row) as f32 * TILE_ROW,
+                            TILE_ROW,
+                            ses.list_view.0,
+                            ses.list_view.1,
+                        )
+                    }) {
+                        area = area.vertical_scroll_offset(to);
+                    }
+                }
+                let out = area.show_rows(ui, TILE_H + GAP, rows, |ui, range| {
+                    for row in range {
+                        let (line, _) =
+                            ui.allocate_exact_size(vec2(width, TILE_H + GAP), Sense::hover());
+                        for k in 0..per_row {
+                            let Some(&i) = ses.visible.get(row * per_row + k) else {
+                                break;
+                            };
+                            let f = &ses.files[i as usize];
+                            let rect = Rect::from_min_size(
+                                pos2(line.left() + k as f32 * (tile_w + GAP), line.top()),
+                                vec2(tile_w, TILE_H),
+                            );
+                            let resp = ui.interact(rect, ui.id().with(("tile", i)), Sense::click());
+                            let active = ses.highlighted == Some(i);
+                            ui.painter().rect_filled(
+                                rect,
+                                CornerRadius::same(10),
+                                if active {
+                                    p.selected
+                                } else if resp.hovered() {
+                                    p.hover
+                                } else {
+                                    p.bg
+                                },
+                            );
+                            ui.painter().rect_stroke(
+                                rect,
+                                CornerRadius::same(10),
+                                Stroke::new(1.0_f32, if active { p.accent } else { p.border }),
+                                StrokeKind::Inside,
+                            );
+                            let picture = Rect::from_min_max(
+                                rect.min + vec2(6.0, 6.0),
+                                pos2(rect.right() - 6.0, rect.top() + 104.0),
+                            );
+                            let ext = f.ext();
+                            let wanted = thumbs_on && crate::preview::has_thumbnail(&ext, f.size);
+                            if wanted {
+                                if let Some(src) = &ses.source {
+                                    self.previewer.want_thumb(i, f, src);
                                 }
                             }
+                            match self.previewer.thumbs.get(&i) {
+                                Some(Some(tex)) if wanted => paint_fitted(ui, picture, tex),
+                                _ => {
+                                    let (icon, color) = category_look(&p, f.category());
+                                    ui.painter().text(
+                                        picture.center(),
+                                        Align2::CENTER_CENTER,
+                                        icon.glyph(),
+                                        regular(34.0),
+                                        color.gamma_multiply(0.85),
+                                    );
+                                }
+                            }
+                            widgets::text_in(
+                                ui,
+                                Rect::from_min_max(
+                                    pos2(rect.left() + 10.0, rect.top() + 106.0),
+                                    pos2(rect.right() - 8.0, rect.top() + 128.0),
+                                ),
+                                &f.name,
+                                regular(13.0),
+                                p.text,
+                            );
+                            let dot = pos2(rect.left() + 15.0, rect.top() + 138.0);
+                            ui.painter()
+                                .circle_filled(dot, 4.0, chance_color(&p, f.chance));
+                            widgets::text_in(
+                                ui,
+                                Rect::from_min_max(
+                                    pos2(rect.left() + 25.0, rect.top() + 128.0),
+                                    pos2(rect.right() - 8.0, rect.top() + 148.0),
+                                ),
+                                &format!("{} · {}", fmt_size(f.size), f.chance.label()),
+                                regular(11.5),
+                                p.faint,
+                            );
+                            // Tick box on a small plate, top left.
+                            let plate =
+                                Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(26.0, 26.0));
+                            ui.painter().rect_filled(
+                                plate,
+                                CornerRadius::same(7),
+                                p.card.gamma_multiply(0.92),
+                            );
+                            let cresp =
+                                ui.interact(plate, ui.id().with(("tile-check", i)), Sense::click());
+                            widgets::paint_checkbox(
+                                ui,
+                                plate,
+                                Some(ses.checked[i as usize]),
+                                cresp.hovered(),
+                            );
+                            if cresp.clicked() {
+                                toggle = Some(i);
+                            } else if resp.double_clicked() {
+                                highlight = Some(i);
+                                open_big = true;
+                            } else if resp.clicked() || resp.secondary_clicked() {
+                                highlight = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if let Some(a) = row_menu(ui, ses, i) {
+                                    action = Some(a);
+                                }
+                            });
                         }
-                    });
+                    }
+                });
+                view = Some((out.state.offset.y, out.inner_rect.height(), per_row));
             });
+        if let Some((offset, tall, per_row)) = view {
+            ses.list_view = (offset, tall);
+            ses.per_row = per_row;
+        }
+        if show_all {
+            self.show_everything(ses);
+        }
         if let Some(i) = toggle {
             ses.toggle(i);
         }
@@ -911,6 +1127,7 @@ impl App {
         if open_big {
             self.big_preview = true;
         }
+        action
     }
 
     // ----------------------------------------------------------------------------------
@@ -1055,10 +1272,17 @@ impl App {
                                 mono(9.5),
                             ),
                         };
-                        let galley = ui.painter().layout(text, font, p.muted, inner.width());
-                        ui.painter()
-                            .with_clip_rect(inner)
-                            .galley(inner.min, galley, p.muted);
+                        // Kurdish, Arabic and the like are laid out by Windows.
+                        let native = x.text.is_some() && super::bidi::needs_native(&text) && {
+                            let short: String = text.chars().take(700).collect();
+                            super::bidi::paint_block(ui, inner, &short, 12.0, p.muted)
+                        };
+                        if !native {
+                            let galley = ui.painter().layout(text, font, p.muted, inner.width());
+                            ui.painter()
+                                .with_clip_rect(inner)
+                                .galley(inner.min, galley, p.muted);
+                        }
                     }
                     _ => {
                         ui.painter().text(
@@ -1088,7 +1312,7 @@ impl App {
                     big = true;
                 }
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(RichText::new(&f.name).font(semibold(16.0))).wrap());
+                widgets::name_label(ui, &f.name, 16.0, true);
                 ui.horizontal(|ui| {
                     widgets::badge(ui, f.chance.label(), chance_color(&p, f.chance));
                     widgets::badge(ui, f.status.label(), p.info);
@@ -1193,9 +1417,7 @@ impl App {
                     vec2(w, 32.0),
                     Layout::left_to_right(Align::Center),
                     |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(&name).font(semibold(17.0))).truncate(),
-                        );
+                        widgets::name_label(ui, &name, 17.0, false);
                         ui.label(RichText::new(fmt_size(size)).color(p.muted));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if widgets::icon_button(ui, Icon::CLOSE, "Close (Esc)").clicked() {
@@ -1230,6 +1452,25 @@ impl App {
                                     Some(t) => (t.as_str(), regular(14.0)),
                                     None => (x.hex.as_str(), mono(13.0)),
                                 };
+                                if x.text.is_some() && super::bidi::needs_native(text) {
+                                    // Paragraph by paragraph, so that each one is
+                                    // aligned by its own direction.
+                                    let wide = ui.available_width() - 8.0;
+                                    let mut drawn = true;
+                                    for para in text.lines().take(400) {
+                                        if para.trim().is_empty() {
+                                            ui.add_space(8.0);
+                                        } else if super::bidi::block(ui, para, 14.0, p.text, wide)
+                                            .is_none()
+                                        {
+                                            drawn = false;
+                                            break;
+                                        }
+                                    }
+                                    if drawn {
+                                        return;
+                                    }
+                                }
                                 ui.add(
                                     egui::Label::new(RichText::new(text).font(font).color(p.text))
                                         .wrap_mode(if x.text.is_some() {
@@ -1252,7 +1493,11 @@ impl App {
                     }
                 }
                 let caption = match full {
+                    Some(x) if x.texture.is_some() && !x.caption.is_empty() => {
+                        format!("{} · {} x {} pixels", x.caption, x.dims.0, x.dims.1)
+                    }
                     Some(x) if x.texture.is_some() => format!("{} x {} pixels", x.dims.0, x.dims.1),
+                    Some(x) if x.text.is_some() && !x.caption.is_empty() => x.caption.to_string(),
                     Some(x) if x.text.is_some() => "The first 64 KB as text".to_string(),
                     Some(x) if !x.head.is_empty() => {
                         "The first 8 KB, byte by byte (offset, hexadecimal, characters)".to_string()

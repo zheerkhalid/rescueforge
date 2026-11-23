@@ -519,6 +519,7 @@ impl App {
             include_existing: self.settings.include_existing,
             carve_off: self.settings.carve_off.clone(),
             tz: self.tz,
+            resume: None,
         }
     }
 
@@ -566,6 +567,30 @@ impl App {
         self.tab = Tab::Results;
     }
 
+    /// Picks a stopped deep scan up where it was. What is listed (and
+    /// ticked) stays; the scan adds what it finds from there on.
+    pub(super) fn continue_scan(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            self.toast(
+                "Something is still running. Stop it or wait for it to finish first.",
+                true,
+            );
+            return;
+        }
+        let Some(ses) = &mut self.ses else { return };
+        let (Some(source), Some(mut point)) = (ses.source.clone(), ses.resume.clone()) else {
+            return;
+        };
+        point.listed = ses.files.len() as u64;
+        let mut options = ses.options.clone();
+        options.resume = Some(point);
+        ses.begin_resume();
+        let wake = ctx.clone();
+        ses.scan = Some(scan::start(source, options, move || wake.request_repaint()));
+        self.fake_scan = None;
+        self.tab = Tab::Results;
+    }
+
     fn poll_scan(&mut self) {
         let Some(ses) = &mut self.ses else { return };
         // A bounded number of messages per frame keeps the window responsive.
@@ -599,6 +624,11 @@ impl App {
             }
         }
         if let Some(stopped) = done {
+            ses.resume = ses
+                .scan
+                .as_ref()
+                .and_then(|h| h.progress.resume())
+                .filter(|_| stopped && ses.options.deep);
             ses.finished = true;
             ses.stopped = stopped;
             ses.elapsed_secs = Some(ses.started.elapsed().as_secs());
@@ -606,8 +636,13 @@ impl App {
             let n = ses.files.len();
             let text = if stopped {
                 format!(
-                    "Scan stopped. {} files found so far.",
-                    crate::util::fmt_count(n as u64)
+                    "Scan stopped. {} files found so far.{}",
+                    crate::util::fmt_count(n as u64),
+                    if ses.resume.is_some() {
+                        " It can be continued later."
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 format!(
@@ -683,6 +718,7 @@ impl App {
             finished: ses.finished && !ses.stopped,
             files: ses.files.clone(),
             log: ses.log.clone(),
+            resume: ses.resume.clone().filter(|_| ses.stopped),
         };
         match saved.save(&path) {
             Ok(()) => {
@@ -692,6 +728,50 @@ impl App {
                 self.toast(format!("Session saved to {}", path.display()), false);
             }
             Err(e) => self.toast(e, true),
+        }
+    }
+
+    /// Writes the list of found files as a CSV table.
+    pub(super) fn export_list(&mut self) {
+        let Some(ses) = &self.ses else { return };
+        if ses.files.is_empty() {
+            return;
+        }
+        if self.demo {
+            self.toast("Demo mode: nothing is written.", false);
+            return;
+        }
+        let name = format!(
+            "{}.csv",
+            crate::util::sanitize_name(&format!("RescueForge list of {}", ses.label))
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export the list of found files")
+            .set_file_name(name)
+            .add_filter("Table for a spreadsheet (CSV)", &["csv"])
+            .save_file()
+        else {
+            return;
+        };
+        // A write like any other: never onto the scanned drive.
+        if let Verdict::Blocked(why) =
+            crate::recover::judge(&ses.spec, &ses.disks, &sys::dest_info(&path))
+        {
+            self.toast(format!("The list was not saved. {why}"), true);
+            return;
+        }
+        let (text, count) = ses.csv(self.tz);
+        match std::fs::write(&path, text) {
+            Ok(()) => self.toast(
+                format!(
+                    "{} file{} listed in {}",
+                    crate::util::fmt_count(count as u64),
+                    if count == 1 { "" } else { "s" },
+                    path.display()
+                ),
+                false,
+            ),
+            Err(e) => self.toast(format!("Could not save \"{}\": {e}", path.display()), true),
         }
     }
 
@@ -769,6 +849,7 @@ impl App {
         ses.log = saved.log;
         ses.finished = true;
         ses.stopped = !saved.finished;
+        ses.resume = saved.resume.filter(|_| !saved.finished);
         ses.saved = true;
         ses.elapsed_secs = None;
         ses.rebuild_now();
@@ -873,6 +954,33 @@ impl App {
             "preview-text" => {
                 ses.highlighted = picture(&ses, "Letter to the landlord.rtf");
             }
+            "preview-doc" => {
+                // The words of a Word document, read out of the deleted file.
+                ses.folder = thesis;
+                ses.rebuild_now();
+                ses.highlighted = ses
+                    .visible
+                    .iter()
+                    .copied()
+                    .find(|i| ses.files[*i as usize].ext() == "docx");
+                self.big_preview = true;
+            }
+            "kurdish" | "kurdish-text" => {
+                // Names and text in Kurdish and Arabic: joined letters, right to left.
+                ses.folder = ses.dirs.intern("Documents/بەڵگەنامەکان");
+                ses.rebuild_now();
+                ses.highlighted = picture(&ses, "نامە بۆ مامۆستا.txt");
+                self.big_preview = view == "kurdish-text";
+            }
+            "stopped" => {
+                ses.stopped = true;
+                ses.elapsed_secs = Some(3600 + 47 * 60);
+                ses.resume = Some(scan::ResumePoint {
+                    pos: (128u64 << 20) * 42 / 100,
+                    ..Default::default()
+                });
+            }
+
             "grid" => {
                 ses.grid = true;
                 ses.cat = Some(crate::model::Category::Pictures);
@@ -974,6 +1082,8 @@ impl App {
         let (mut all, mut none, mut save, mut open, mut rec) = (false, false, false, false, false);
         let (mut up, mut down, mut space, mut enter, mut pause) =
             (false, false, false, false, false);
+        let (mut left, mut right, mut page_up, mut page_down) = (false, false, false, false);
+        let (mut home, mut end, mut export) = (false, false, false);
         ctx.input(|i| {
             find = i.modifiers.command && i.key_pressed(Key::F);
             refresh = i.key_pressed(Key::F5);
@@ -985,8 +1095,15 @@ impl App {
             open = i.modifiers.command && i.key_pressed(Key::O);
             rec = i.modifiers.command && i.key_pressed(Key::R);
             pause = i.modifiers.command && i.key_pressed(Key::P);
+            export = i.modifiers.command && i.key_pressed(Key::E);
             up = i.key_pressed(Key::ArrowUp);
             down = i.key_pressed(Key::ArrowDown);
+            left = i.key_pressed(Key::ArrowLeft);
+            right = i.key_pressed(Key::ArrowRight);
+            page_up = i.key_pressed(Key::PageUp);
+            page_down = i.key_pressed(Key::PageDown);
+            home = i.key_pressed(Key::Home);
+            end = i.key_pressed(Key::End);
             space = i.key_pressed(Key::Space);
             enter = i.key_pressed(Key::Enter);
         });
@@ -1038,6 +1155,9 @@ impl App {
         if rec {
             self.open_recover_dialog(None);
         }
+        if export && self.ses.is_some() {
+            self.export_list();
+        }
         let Some(s) = &mut self.ses else { return };
         if typing {
             return;
@@ -1048,11 +1168,36 @@ impl App {
         if none {
             s.clear_selection();
         }
+        // In the thumbnail grid, up and down move by a row of tiles.
+        let (line, row_height) = if s.grid {
+            (s.per_row.max(1) as i64, super::results::TILE_ROW)
+        } else {
+            (1, super::results::LIST_ROW)
+        };
+        let page = ((s.list_view.1 / row_height).floor() as i64).max(1) * line;
         if down {
-            s.step_highlight(1);
+            s.step_highlight(line);
         }
         if up {
+            s.step_highlight(-line);
+        }
+        if s.grid && right {
+            s.step_highlight(1);
+        }
+        if s.grid && left {
             s.step_highlight(-1);
+        }
+        if page_down {
+            s.step_highlight(page);
+        }
+        if page_up {
+            s.step_highlight(-page);
+        }
+        if home {
+            s.jump_highlight(false);
+        }
+        if end {
+            s.jump_highlight(true);
         }
         if let Some(h) = s.highlighted {
             if space {
@@ -1537,7 +1682,7 @@ impl App {
             |ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.add(egui::Label::new(RichText::new(title).font(semibold(24.0))).truncate());
+                    widgets::name_label(ui, title, 24.0, false);
                     ui.add(egui::Label::new(RichText::new(subtitle).color(p.muted)).truncate());
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), actions);
@@ -1579,14 +1724,20 @@ impl App {
 }
 
 pub(super) const SHORTCUTS: &[(&str, &str)] = &[
-    ("Ctrl+F", "Search the found files by name"),
-    ("Up / Down", "Move through the list"),
+    ("Ctrl+F", "Search by name: words, or patterns like *.jpg"),
+    (
+        "Up / Down",
+        "Move through the list (arrows in the thumbnail grid)",
+    ),
+    ("Page Up / Down", "Move a screenful"),
+    ("Home / End", "Go to the first or the last file shown"),
     ("Space", "Tick or untick the highlighted file"),
     ("Enter", "Open the large preview"),
     ("Ctrl+A", "Tick every file that is shown"),
     ("Ctrl+D", "Untick everything"),
     ("Ctrl+R", "Recover the ticked files"),
     ("Ctrl+S", "Save the scan to a session file"),
+    ("Ctrl+E", "Export the list as a table (CSV)"),
     ("Ctrl+O", "Open a saved session"),
     ("Ctrl+P", "Pause or resume the scan"),
     ("F5", "Refresh the list of drives"),

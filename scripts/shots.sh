@@ -3,7 +3,7 @@
 exe="$1"; out="$2"; shift 2
 export __COMPAT_LAYER=RunAsInvoker
 views="$*"
-[ -z "$views" ] && views="home home-quick scanning results preview preview-text bigpreview grid recover recover-blocked recover-running recover-done images imaging log settings welcome shortcuts about"
+[ -z "$views" ] && views="home home-quick scanning stopped results preview preview-text bigpreview preview-doc kurdish kurdish-text grid recover recover-blocked recover-running recover-done images imaging log settings welcome shortcuts about"
 mkdir -p "$out"
 for v in $views; do
   "$exe" --demo --screenshot "$out/$v.png" --view "$v" || echo "failed: $v"

@@ -87,6 +87,25 @@ pub const TYPES: &[TypeInfo] = &[
         ],
     ),
     ty(
+        "jp2",
+        "JPEG 2000 (JP2, J2K)",
+        Category::Pictures,
+        &["jp2", "j2k"],
+    ),
+    ty("djvu", "DjVu", Category::Pictures, &["djvu"]),
+    ty(
+        "emf",
+        "Enhanced metafile (EMF)",
+        Category::Pictures,
+        &["emf"],
+    ),
+    ty(
+        "ico",
+        "Icons and cursors (ICO, CUR)",
+        Category::Pictures,
+        &["ico", "cur"],
+    ),
+    ty(
         "mp4",
         "MP4 / MOV / M4V / 3GP",
         Category::Video,
@@ -103,6 +122,12 @@ pub const TYPES: &[TypeInfo] = &[
         &["ts", "m2ts"],
     ),
     ty("ogv", "Ogg video", Category::Video, &["ogv"]),
+    ty(
+        "mpg",
+        "MPEG program stream (MPG, VOB)",
+        Category::Video,
+        &["mpg"],
+    ),
     ty("mp3", "MP3", Category::Audio, &["mp3"]),
     ty("wav", "WAV", Category::Audio, &["wav"]),
     ty("flac", "FLAC", Category::Audio, &["flac"]),
@@ -116,6 +141,11 @@ pub const TYPES: &[TypeInfo] = &[
     ty("wma", "WMA", Category::Audio, &["wma"]),
     ty("mid", "MIDI", Category::Audio, &["mid"]),
     ty("aif", "AIFF", Category::Audio, &["aif"]),
+    ty("dsf", "DSD audio (DSF)", Category::Audio, &["dsf"]),
+    ty("wv", "WavPack", Category::Audio, &["wv"]),
+    ty("ape", "Monkey's Audio (APE)", Category::Audio, &["ape"]),
+    ty("amr", "AMR speech", Category::Audio, &["amr"]),
+    ty("au", "Sun / NeXT audio (AU)", Category::Audio, &["au"]),
     ty("pdf", "PDF", Category::Documents, &["pdf"]),
     ty(
         "docx",
@@ -150,6 +180,13 @@ pub const TYPES: &[TypeInfo] = &[
     ),
     ty("svg", "SVG", Category::Pictures, &["svg"]),
     ty("html", "HTML", Category::Documents, &["html"]),
+    ty("vcf", "Contacts (vCard)", Category::Documents, &["vcf"]),
+    ty(
+        "ics",
+        "Calendars (iCalendar)",
+        Category::Documents,
+        &["ics"],
+    ),
     TypeInfo {
         id: "txt",
         label: "Plain text (many false finds)",
@@ -169,6 +206,9 @@ pub const TYPES: &[TypeInfo] = &[
     ty("xz", "XZ", Category::Archives, &["xz"]),
     ty("tar", "TAR", Category::Archives, &["tar"]),
     ty("cab", "Cabinet (CAB)", Category::Archives, &["cab"]),
+    ty("zst", "Zstandard (ZST)", Category::Archives, &["zst"]),
+    ty("lz4", "LZ4", Category::Archives, &["lz4"]),
+    ty("deb", "Debian packages (DEB)", Category::Archives, &["deb"]),
     ty(
         "exe",
         "Programs (EXE, DLL, SYS, MSI)",
@@ -176,6 +216,29 @@ pub const TYPES: &[TypeInfo] = &[
         &["exe", "dll", "sys", "msi"],
     ),
     ty("sqlite", "SQLite databases", Category::Other, &["sqlite"]),
+    ty("elf", "Linux programs (ELF)", Category::Other, &["elf"]),
+    ty("ar", "Static libraries (A)", Category::Other, &["a"]),
+    ty(
+        "font",
+        "Fonts (TTF, OTF, WOFF, WOFF2)",
+        Category::Other,
+        &["ttf", "otf", "woff", "woff2"],
+    ),
+    ty("swf", "Flash (SWF)", Category::Other, &["swf"]),
+    ty("hve", "Windows registry hives", Category::Other, &["hve"]),
+    ty(
+        "evtx",
+        "Windows event logs (EVTX)",
+        Category::Other,
+        &["evtx"],
+    ),
+    ty("lnk", "Windows shortcuts (LNK)", Category::Other, &["lnk"]),
+    ty(
+        "pcap",
+        "Network captures (PCAP)",
+        Category::Other,
+        &["pcap"],
+    ),
 ];
 
 /// The ids that are switched off unless the user enables them.
@@ -294,6 +357,25 @@ pub fn strong_magic(h: &[u8]) -> bool {
         || h.starts_with(&[0x1A, 0x45, 0xDF, 0xA3])
         || h.starts_with(b"SQLite format 3\0")
         || h.starts_with(b"FILE0")
+        || h.starts_with(b"OTTO")
+        || h.starts_with(b"wOFF")
+        || h.starts_with(b"wOF2")
+        || h.starts_with(&formats::JP2_SIGNATURE)
+        || h.starts_with(b"AT&TFORM")
+        || h.starts_with(b"DSD \x1C\0\0\0")
+        || h.starts_with(b"wvpk")
+        || h.starts_with(b"#!AMR")
+        || h.starts_with(b".snd")
+        || h.starts_with(&[0x00, 0x00, 0x01, 0xBA])
+        || h.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
+        || h.starts_with(&[0x04, 0x22, 0x4D, 0x18])
+        || h.starts_with(b"!<arch>\n")
+        || h.starts_with(b"ElfFile\0")
+        || h.starts_with(b"BEGIN:VCARD")
+        || h.starts_with(b"BEGIN:VCALENDAR")
+        || h.starts_with(b"\x7FELF")
+        || h.starts_with(&[0xD4, 0xC3, 0xB2, 0xA1])
+        || h.starts_with(&formats::LNK_HEADER)
         || &h[4..8] == b"ftyp"
         || (h.starts_with(b"MZ") && h.len() >= 64)
 }
@@ -340,6 +422,26 @@ impl Carver {
         let w = &mut w;
         use formats as f;
         let found = match head[0] {
+            // Blank sectors start with a zero too, so this arm has to be quick.
+            0x00 => match (head[1], head[2], head[3]) {
+                (0, 1, 0xBA) if self.any(&["mpg"]) => f::mpeg_ps(w),
+                (1, 0, 0) if self.any(&["ttf"]) => f::sfnt(w),
+                (0, 0, 0x0C) if head.starts_with(&f::JP2_SIGNATURE) && self.any(&["jp2"]) => {
+                    f::jp2(w)
+                }
+                (0, 1 | 2, 0) if head[5] == 0 && self.any(&["ico", "cur"]) => f::ico(w),
+                _ => None,
+            },
+            0x01 if head[..4] == [1, 0, 0, 0] && &head[40..44] == b" EMF" && self.any(&["emf"]) => {
+                f::emf(w)
+            }
+            0x04 if head.starts_with(&[0x04, 0x22, 0x4D, 0x18]) && self.any(&["lz4"]) => f::lz4(w),
+            0x28 if head.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) && self.any(&["zst"]) => f::zstd(w),
+            0x7F if head.starts_with(b"\x7FELF") && self.any(&["elf"]) => f::elf(w),
+            0xD4 if head.starts_with(&[0xD4, 0xC3, 0xB2, 0xA1]) && self.any(&["pcap"]) => {
+                f::pcap(w)
+            }
+            0xFF if head[1..4] == [0x4F, 0xFF, 0x51] && self.any(&["j2k"]) => f::j2k(w),
             0xFF if head[1] == 0xD8 && head[2] == 0xFF && self.any(&["jpg"]) => f::jpeg(w),
             0xFF if head[1] & 0xE0 == 0xE0 && self.any(&["mp3"]) => f::mp3(w),
             0x89 if head.starts_with(b"\x89PNG\r\n\x1a\n") && self.any(&["png"]) => f::png(w),
@@ -361,6 +463,26 @@ impl Carver {
             b'M' if head[1] == b'Z' && self.any(&["exe", "dll", "sys"]) => f::pe(w),
             b'M' if head.starts_with(b"MThd") && self.any(&["mid"]) => f::midi(w),
             b'M' if head.starts_with(b"MSCF") && self.any(&["cab"]) => f::cab(w),
+            b'M' if head.starts_with(b"MAC ") && self.any(&["ape"]) => f::ape(w),
+            b'M' if head.starts_with(&[0x4D, 0x3C, 0xB2, 0xA1]) && self.any(&["pcap"]) => {
+                f::pcap(w)
+            }
+            b'L' if head.starts_with(&f::LNK_HEADER) && self.any(&["lnk"]) => f::lnk(w),
+            b'O' if head.starts_with(b"OTTO") && self.any(&["otf"]) => f::sfnt(w),
+            b'w' if (head.starts_with(b"wOFF") || head.starts_with(b"wOF2"))
+                && self.any(&["woff", "woff2"]) =>
+            {
+                f::woff(w)
+            }
+            b'w' if head.starts_with(b"wvpk") && self.any(&["wv"]) => f::wavpack(w),
+            b'A' if head.starts_with(b"AT&TFORM") && self.any(&["djvu"]) => f::djvu(w),
+            b'D' if head.starts_with(b"DSD ") && self.any(&["dsf"]) => f::dsf(w),
+            b'#' if head.starts_with(b"#!AMR") && self.any(&["amr"]) => f::amr(w),
+            b'.' if head.starts_with(b".snd") && self.any(&["au"]) => f::au(w),
+            b'r' if head.starts_with(b"regf") && self.any(&["hve"]) => f::regf(w),
+            b'E' if head.starts_with(b"ElfFile\0") && self.any(&["evtx"]) => f::evtx(w),
+            b'B' if head.starts_with(b"BEGIN:VCARD") && self.any(&["vcf"]) => f::vcard(w),
+            b'B' if head.starts_with(b"BEGIN:VCALENDAR") && self.any(&["ics"]) => f::icalendar(w),
             b'R' if head.starts_with(b"RIFF") && self.any(&["avi", "wav", "webp"]) => f::riff(w),
             b'R' if head.starts_with(b"Rar!\x1a\x07") && self.any(&["rar"]) => f::rar(w),
             b'8' if head.starts_with(b"8BPS") && self.any(&["psd", "psb"]) => f::psd(w),
@@ -384,10 +506,12 @@ impl Carver {
             0xFD if head.starts_with(b"\xFD7zXZ\0") && self.any(&["xz"]) => f::xz(w),
             b'S' if head.starts_with(b"SQLite format 3\0") && self.any(&["sqlite"]) => f::sqlite(w),
             b'!' if head.starts_with(b"!BDN") && self.any(&["pst", "ost"]) => f::pst(w),
+            b'!' if head.starts_with(b"!<arch>\n") && self.any(&["deb", "a"]) => f::ar(w),
             b'{' if head.starts_with(b"{\\rtf1") && self.any(&["rtf"]) => f::rtf(w),
             b'F' if head.starts_with(b"FORM") && self.any(&["aif"]) => f::aiff(w),
             b'F' if head.starts_with(b"FUJIFILMCCD-RAW") && self.any(&["raf"]) => f::raf(w),
             b'F' if head.starts_with(b"FLV\x01") && self.any(&["flv"]) => f::flv(w),
+            b'F' if head.starts_with(b"FWS") && self.any(&["swf"]) => f::swf(w),
             b'<' if self.any(&["xml", "svg", "plist", "kml", "gpx", "html"]) => f::markup(w),
             _ => None,
         };

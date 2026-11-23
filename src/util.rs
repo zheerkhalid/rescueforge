@@ -254,6 +254,8 @@ pub fn sanitize_name(name: &str) -> String {
         // Keep the extension when shortening.
         let ext = ext_of(&out);
         let keep: String = out.chars().take(170).collect();
+        // Windows drops spaces and dots at the end of a name by itself.
+        let keep = keep.trim_end_matches([' ', '.']).to_string();
         out = if ext.is_empty() {
             keep
         } else {
@@ -407,5 +409,15 @@ mod tests {
         let long = "x".repeat(400) + ".jpeg";
         let s = sanitize_name(&long);
         assert!(s.chars().count() <= 180 && s.ends_with(".jpeg"));
+        // Shortening never leaves a name that ends in a space or a dot.
+        let spaced = format!("{}{}", "y".repeat(160), " ".repeat(60));
+        assert_eq!(sanitize_name(&format!("{spaced}tail")), "y".repeat(160));
+        assert_eq!(
+            sanitize_name(&format!("{spaced}tail.pdf")),
+            format!("{}.pdf", "y".repeat(160))
+        );
+        let kurdish = "ڕاپۆرتی ساڵانە ٢٠٢٥.pdf";
+        assert_eq!(sanitize_name(kurdish), kurdish);
+        assert_eq!(ext_of(kurdish), "pdf");
     }
 }

@@ -722,11 +722,32 @@ fn office(seed: u64, part: &str) -> Vec<u8> {
     office_with(seed, part, 0)
 }
 
+/// The main part of a Word document: a heading and a few paragraphs.
+fn word_body(seed: u64) -> Vec<u8> {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>",
+    );
+    for i in 0..6 {
+        let words = if i == 0 { 5 } else { 45 };
+        out.push_str(&format!(
+            "<w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+            prose(seed + 2 * i, words)
+        ));
+    }
+    out.push_str("</w:body></w:document>");
+    out.into_bytes()
+}
+
 fn office_with(seed: u64, part: &str, media: usize) -> Vec<u8> {
+    let main = if part == "word/document.xml" {
+        word_body(seed + 2)
+    } else {
+        xml(seed + 2)
+    };
     let mut entries = vec![
         ("[Content_Types].xml", xml(seed)),
         ("_rels/.rels", xml(seed + 1)),
-        (part, xml(seed + 2)),
+        (part, main),
         ("docProps/core.xml", xml(seed + 3)),
     ];
     if media > 0 {

@@ -95,6 +95,28 @@ pub fn restart_as_admin() -> Result<(), String> {
     shell_execute("runas", &exe.to_string_lossy(), "")
 }
 
+/// Text in the system's own "ANSI" code page (what Notepad used to save
+/// before UTF-8 became the default), as a string.
+pub fn ansi_to_string(bytes: &[u8]) -> String {
+    use windows::Win32::Globalization::{
+        MultiByteToWideChar, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
+    };
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
+    // SAFETY: both calls get valid slices; the second buffer has the size the first call asked for.
+    unsafe {
+        let n = MultiByteToWideChar(CP_ACP, flags, bytes, None);
+        if n <= 0 {
+            return bytes.iter().map(|b| *b as char).collect();
+        }
+        let mut wide = vec![0u16; n as usize];
+        let n = MultiByteToWideChar(CP_ACP, flags, bytes, Some(&mut wide));
+        String::from_utf16_lossy(&wide[..n.max(0) as usize])
+    }
+}
+
 /// The local offset from UTC in seconds (east is positive).
 pub fn tz_offset_secs() -> i32 {
     let mut info = TIME_ZONE_INFORMATION::default();

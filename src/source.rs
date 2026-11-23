@@ -268,6 +268,29 @@ impl BlockSource for FlakySource {
     }
 }
 
+/// A source that presses "Stop" by itself when a scan reads a whole chunk
+/// at or after `at`: makes stopping a deep scan part way repeatable (tests
+/// and the self-test).
+pub struct StopAt {
+    pub inner: Source,
+    pub at: u64,
+    pub ctl: Arc<crate::control::Control>,
+}
+
+impl BlockSource for StopAt {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        // Only the sector-by-sector pass reads whole megabytes at once.
+        if buf.len() >= 1 << 20 && offset >= self.at {
+            self.ctl.stop();
+        }
+        self.inner.read_at(offset, buf);
+        Ok(())
+    }
+}
+
 impl MemSource {
     fn read_at_slice(data: &[u8], offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let start = usize::try_from(offset).map_err(|_| io::ErrorKind::UnexpectedEof)?;

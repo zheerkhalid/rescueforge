@@ -481,6 +481,212 @@ fn corrupted_volumes_never_panic_or_hang() {
     }
 }
 
+/// Runs a deep scan that is stopped while reading at `at`.
+fn scan_until(data: &[u8], at: u64) -> (Vec<FoundFile>, Option<crate::scan::ResumePoint>, bool) {
+    use crate::control::{Control, Progress};
+    use crate::scan::{run, ScanMsg};
+    let ctl = Arc::new(Control::new());
+    let src = Source::new(Arc::new(crate::source::StopAt {
+        inner: Source::from_bytes(data.to_vec()),
+        at,
+        ctl: ctl.clone(),
+    }));
+    let progress = Progress::new();
+    let mut files: Vec<FoundFile> = Vec::new();
+    let mut stopped = false;
+    run(&src, &deep(), &ctl, &progress, &mut |m| match m {
+        ScanMsg::Files(f) => files.extend(f),
+        ScanMsg::Retract(set) => files.retain(|f| !crate::scan::is_retracted(f, &set)),
+        ScanMsg::Finished { stopped: s } => stopped = s,
+        ScanMsg::Log(_) => {}
+    });
+    (files, progress.resume(), stopped)
+}
+
+/// An image without a file system, several read chunks long, with files
+/// spread over it; one of them lies across a chunk border.
+fn long_image() -> (Vec<u8>, Vec<(usize, Vec<u8>)>) {
+    const MB: usize = 1 << 20;
+    let mut img = vec![0u8; 21 * MB];
+    let planted = vec![
+        (4096usize, samples::jpeg(1, 200, 150)),
+        (2 * MB, samples::xlsx(2)),
+        (4 * MB - 8192, samples::mp4(3, 60_000)),
+        (6 * MB, samples::rar5(4, 7000)),
+        (9 * MB + 512, samples::png(5, 320, 200)),
+        (13 * MB, samples::pdf(6)),
+        (17 * MB, samples::jpeg(7, 240, 180)),
+        (20 * MB + 4096, samples::docx(8)),
+    ];
+    for (off, data) in &planted {
+        img[*off..*off + data.len()].copy_from_slice(data);
+    }
+    (img, planted)
+}
+
+#[test]
+fn a_stopped_deep_scan_continues_where_it_was() {
+    use crate::control::{Control, Progress};
+    use crate::scan::{run, ResumePoint, ScanMsg};
+    const MB: u64 = 1 << 20;
+    let (img, planted) = long_image();
+    let src = Source::from_bytes(img.clone());
+    let (whole, _) = run_collect(&src, &deep());
+    assert_eq!(whole.len(), planted.len(), "{whole:#?}");
+
+    // "Stop" is pressed while the third chunk (8 to 12 MB) is being read:
+    // that chunk is finished, the rest is left.
+    let (first, point, stopped) = scan_until(&img, 8 * MB);
+    assert!(stopped);
+    let point = point.expect("a stopped deep scan can be continued");
+    assert_eq!(first.len(), 5, "{first:#?}");
+    assert_eq!(
+        point,
+        ResumePoint {
+            pos: 12 * MB,
+            skip_until: point.skip_until,
+            lost: Vec::new(),
+            listed: 5,
+        }
+    );
+    assert!(point.skip_until > 9 * MB && point.skip_until < 10 * MB);
+
+    // Continue: only the rest is read, and nothing is listed twice.
+    let progress = Progress::new();
+    let mut log = Vec::new();
+    let mut rest: Vec<FoundFile> = Vec::new();
+    let opts = ScanOptions {
+        resume: Some(point.clone()),
+        ..deep()
+    };
+    run(&src, &opts, &Control::new(), &progress, &mut |m| match m {
+        ScanMsg::Files(f) => rest.extend(f),
+        ScanMsg::Log(l) => log.push(l),
+        _ => {}
+    });
+    assert!(
+        log[0].starts_with("Continuing the deep scan at 12.0 MB"),
+        "{log:#?}"
+    );
+    assert!(log
+        .iter()
+        .any(|l| l.contains("3 files recognised by content since the scan was continued")));
+    assert_eq!(
+        progress.resume(),
+        None,
+        "finished: nothing left to continue"
+    );
+    assert_eq!(progress.fraction(), 1.0);
+    assert_eq!(rest.len(), 3, "{rest:#?}");
+    assert!(rest.iter().all(|f| f.first_offset().unwrap() >= point.pos));
+    for (off, data) in &planted {
+        let f = first
+            .iter()
+            .chain(&rest)
+            .find(|f| f.first_offset() == Some(*off as u64))
+            .unwrap_or_else(|| panic!("the file at {off} is missing"));
+        assert!(content(&src, f) == *data, "file at {off}");
+    }
+
+    // A file that reaches past the stop is not looked into again.
+    let (cut, point, _) = scan_until(&img, 0);
+    let point = point.unwrap();
+    assert_eq!(cut.len(), 3);
+    assert_eq!(point.pos, 4 * MB);
+    assert_eq!(
+        point.skip_until,
+        ((4 * MB - 8192 + planted[2].1.len() as u64).div_ceil(512)) * 512
+    );
+    let (after, _) = run_collect(
+        &src,
+        &ScanOptions {
+            resume: Some(point.clone()),
+            ..deep()
+        },
+    );
+    assert_eq!(after.len(), 5, "{after:#?}");
+
+    // A resume point that lies beyond this source is ignored: full scan.
+    let (full, log) = run_collect(
+        &src,
+        &ScanOptions {
+            resume: Some(ResumePoint {
+                pos: 1 << 40,
+                ..Default::default()
+            }),
+            ..deep()
+        },
+    );
+    assert_eq!(full.len(), planted.len());
+    assert!(log[0].starts_with("Deep scan of"));
+    // A quick scan never resumes.
+    let (quick_files, log) = run_collect(
+        &src,
+        &ScanOptions {
+            resume: Some(point),
+            ..quick()
+        },
+    );
+    assert!(quick_files.is_empty());
+    assert!(log[0].starts_with("Quick scan of"));
+}
+
+#[test]
+fn continuing_on_a_volume_lists_only_what_is_new() {
+    // An NTFS volume with deleted files, and files without any record in
+    // its free space behind the first read chunks.
+    let mut img = testimg::ntfs::build(&sample_tree(), 16 << 20);
+    let extra = [
+        (9usize << 20, samples::jpeg(21, 200, 150)),
+        (13 << 20, samples::png(22, 200, 150)),
+    ];
+    for (off, data) in &extra {
+        assert!(
+            img[*off..*off + data.len()].iter().all(|b| *b == 0),
+            "the test needs free space at {off}"
+        );
+        img[*off..*off + data.len()].copy_from_slice(data);
+    }
+    let src = Source::from_bytes(img.clone());
+    let (whole, _) = run_collect(&src, &deep());
+    let named = whole.iter().filter(|f| f.origin != Origin::Carved).count();
+    assert!(named >= 8);
+    assert!(whole.iter().filter(|f| f.origin == Origin::Carved).count() >= 2);
+
+    let (first, point, stopped) = scan_until(&img, 4 << 20);
+    assert!(stopped);
+    let point = point.expect("can be continued");
+    assert_eq!(point.pos, 8 << 20);
+    assert_eq!(
+        first.iter().filter(|f| f.origin != Origin::Carved).count(),
+        named,
+        "the file table was read before the stop"
+    );
+    let (rest, log) = run_collect(
+        &src,
+        &ScanOptions {
+            resume: Some(point),
+            ..deep()
+        },
+    );
+    assert!(
+        rest.iter().all(|f| f.origin == Origin::Carved),
+        "the file table is read again but not listed again: {rest:#?}"
+    );
+    assert!(rest.len() >= 2);
+    assert_eq!(
+        log.iter().filter(|l| l.contains("file system")).count(),
+        0,
+        "{log:#?}"
+    );
+    let key = |f: &FoundFile| (f.path.clone(), f.name.clone(), f.size);
+    let mut both: Vec<_> = first.iter().chain(&rest).map(key).collect();
+    both.sort();
+    let mut expected: Vec<_> = whole.iter().map(key).collect();
+    expected.sort();
+    assert_eq!(both, expected);
+}
+
 #[test]
 fn scans_can_be_stopped_and_run_on_a_worker_thread() {
     use crate::control::{Control, Progress};

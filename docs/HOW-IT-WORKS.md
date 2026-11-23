@@ -79,8 +79,13 @@ camera RAW (CR2, CR3, NEF, ARW, DNG, ORF, RW2, PEF, SRW, RAF), MP4, MOV, M4V,
 OGG/Opus, M4A, WMA, MIDI, AIFF, PDF, DOCX/XLSX/PPTX (told apart by what is
 inside), DOC/XLS/PPT/MSG, OpenDocument, EPUB, RTF, Outlook PST/OST, XML, SVG,
 HTML, plain text (off unless you switch it on), ZIP, JAR, APK, RAR, 7z, GZIP,
-XZ, TAR, CAB, EXE/DLL/SYS/MSI and SQLite databases. The list in Settings
-lets you switch types off.
+XZ, TAR, CAB, EXE/DLL/SYS/MSI and SQLite databases. Since version 1.1 also
+JPEG 2000, DjVu, EMF, icons and cursors, MPEG program streams (MPG, VOB),
+WavPack, Monkey's Audio, DSD, AMR, AU, vCard contacts, iCalendar files,
+Zstandard, LZ4, Debian packages and static libraries, fonts (TTF, OTF, WOFF,
+WOFF2), Flash, Windows shortcuts, registry hives and event logs, Linux
+programs and network captures. The list in Settings lets you switch types
+off.
 
 **Finding lost partitions.** Every volume starts with a "boot sector" that
 describes it, and NTFS, FAT32 and exFAT keep a spare copy. If a partition was
@@ -104,6 +109,28 @@ A deep scan takes as long as it takes to read the whole drive: minutes for a
 memory card, hours for a large hard disk. You can pause, resume or stop it,
 use the results while it runs, and save the result list to a session file
 so that the scan never has to be repeated.
+
+**Continuing a stopped scan.** When a deep scan is stopped, RescueForge
+remembers how far it had read. "Continue scan" goes on from there: the list
+and your ticks stay, and only the rest of the drive is read. The position is
+saved in session files too, so you can stop in the evening, save, and go on
+the next day. Two things to know: the drive's table of contents is read
+again when the scan continues (that takes moments, and nothing is listed
+twice), and the folders of an *earlier* file system are rebuilt from each
+part of the scan separately, so some of those files may show a shorter
+folder path than one uninterrupted scan would give.
+
+## Looking before recovering
+
+The preview reads a file from the scanned drive exactly as a recovery would,
+without writing anything. Pictures are decoded; camera RAW photos, Photoshop
+files and songs show the picture stored inside them; Word, PowerPoint, Excel
+and OpenDocument files show their text; ZIP archives list their contents;
+text is shown as text (also Kurdish, Arabic and other right-to-left
+writing, laid out by Windows the way File Explorer does it); everything else
+is shown byte by byte. A preview that looks right is the best sign that the
+recovered file will open. Document and RAW previews read only the first few
+megabytes of a file, so a missing preview does not prove the file is bad.
 
 ## Disk images
 

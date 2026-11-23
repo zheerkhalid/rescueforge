@@ -296,6 +296,19 @@ pub fn chip(ui: &mut Ui, label: &str, count: Option<usize>, active: bool) -> Res
     ui.add(b)
 }
 
+/// A one-line heading or name that is cut off when too wide. Right-to-left
+/// names are drawn by Windows so that their letters join.
+pub fn name_label(ui: &mut Ui, text: &str, size: f32, wrap: bool) -> Response {
+    let p = pal(ui);
+    if super::bidi::needs_native(text) {
+        if let Some(r) = super::bidi::label(ui, text, size, true, p.text) {
+            return r;
+        }
+    }
+    let label = egui::Label::new(RichText::new(text).font(semibold(size)));
+    ui.add(if wrap { label.wrap() } else { label.truncate() })
+}
+
 /// Lays out one line of text, cut off with an ellipsis at `max_width`.
 pub fn elided(
     ui: &Ui,
@@ -316,6 +329,12 @@ pub fn elided(
 
 /// Paints one elided line, vertically centred in `rect`. Returns whether it was cut.
 pub fn text_in(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color32) -> bool {
+    if super::bidi::needs_native(text) {
+        let bold = font.family != egui::FontFamily::Proportional;
+        if let Some(cut) = super::bidi::paint(ui, rect, text, font.size, bold, color, false) {
+            return cut;
+        }
+    }
     let galley = elided(ui, text, font, color, rect.width());
     let cut = galley.elided;
     ui.painter().galley(
@@ -328,6 +347,12 @@ pub fn text_in(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color32) ->
 
 /// Like [`text_in`], right-aligned.
 pub fn text_in_right(ui: &Ui, rect: Rect, text: &str, font: FontId, color: Color32) {
+    if super::bidi::needs_native(text) {
+        let bold = font.family != egui::FontFamily::Proportional;
+        if super::bidi::paint(ui, rect, text, font.size, bold, color, true).is_some() {
+            return;
+        }
+    }
     let galley = elided(ui, text, font, color, rect.width());
     ui.painter().galley(
         pos2(
@@ -396,11 +421,16 @@ pub fn field(ui: &mut Ui, label: &str, value: &str) {
     } else {
         p.text
     };
-    ui.add(
-        egui::Label::new(RichText::new(shown).color(color))
-            .wrap()
-            .selectable(true),
-    );
+    // Kurdish, Arabic and other right-to-left text is drawn by Windows.
+    if !(super::bidi::needs_native(shown)
+        && super::bidi::label(ui, shown, 14.0, false, color).is_some())
+    {
+        ui.add(
+            egui::Label::new(RichText::new(shown).color(color))
+                .wrap()
+                .selectable(true),
+        );
+    }
     ui.add_space(2.0);
 }
 

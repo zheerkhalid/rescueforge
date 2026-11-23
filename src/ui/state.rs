@@ -3,7 +3,7 @@
 //! No drawing happens here, so this part is unit-tested.
 
 use crate::model::{Category, Chance, FoundFile, SourceSpec, Status};
-use crate::scan::{ScanHandle, ScanOptions};
+use crate::scan::{ResumePoint, ScanHandle, ScanOptions};
 use crate::source::Source;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -232,6 +232,81 @@ fn cmp_ci(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Does `text` match a pattern with `*` (any run of characters) and `?`
+/// (any one character)?
+fn glob(pat: &[char], text: &[char]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pat.len() && (pat[p] == '?' || pat[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((sp, st)) = star {
+            p = sp + 1;
+            t = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    pat[p..].iter().all(|c| *c == '*')
+}
+
+/// One word of the search box.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Term {
+    /// The name contains this text.
+    Has(String),
+    /// The whole name matches this pattern (`*.jpg`, `img_20??.*`).
+    Glob(Vec<char>),
+}
+
+/// Splits what was typed into words; every word has to match.
+fn parse_search(search: &str) -> Vec<Term> {
+    search
+        .split_whitespace()
+        .map(|w| {
+            let w = w.to_lowercase();
+            if w.contains(['*', '?']) {
+                Term::Glob(w.chars().collect())
+            } else {
+                Term::Has(w)
+            }
+        })
+        .collect()
+}
+
+fn matches_search(terms: &[Term], name: &str) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let name = name.to_lowercase();
+    let mut chars: Option<Vec<char>> = None;
+    terms.iter().all(|t| match t {
+        Term::Has(w) => name.contains(w.as_str()),
+        Term::Glob(p) => glob(p, chars.get_or_insert_with(|| name.chars().collect())),
+    })
+}
+
+/// One field of a CSV line, quoted when needed. Text that a spreadsheet
+/// would run as a formula is defused with a leading apostrophe.
+fn csv_field(text: &str) -> String {
+    let risky = text.starts_with(['=', '+', '-', '@', '\t', '\r']);
+    let text = if risky {
+        format!("'{text}")
+    } else {
+        text.to_string()
+    };
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+
 fn chance_rank(c: Chance) -> u8 {
     match c {
         Chance::Good => 0,
@@ -277,7 +352,21 @@ pub struct Session {
     pub sort: (Col, bool),
     pub grid: bool,
     search: String,
+    terms: Vec<Term>,
     now: i64,
+
+    /// Where a stopped deep scan can be picked up again.
+    pub resume: Option<ResumePoint>,
+    /// Entries that were already listed before the scan was continued:
+    /// the continued scan reads the file tables again and must not list
+    /// them twice.
+    seen: HashSet<u64>,
+    /// The highlighted row should be brought into view (keyboard moves).
+    pub scroll_to_highlight: bool,
+    /// Scroll position and height of the list, as last drawn.
+    pub list_view: (f32, f32),
+    /// Tiles per row of the thumbnail grid, as last drawn.
+    pub per_row: usize,
 
     // Derived by `rebuild`.
     pub visible: Vec<u32>,
@@ -336,7 +425,13 @@ impl Session {
             sort: (Col::Folder, true),
             grid: false,
             search: String::new(),
+            terms: Vec::new(),
             now,
+            resume: None,
+            seen: HashSet::new(),
+            scroll_to_highlight: false,
+            list_view: (0.0, 0.0),
+            per_row: 1,
             visible: Vec::new(),
             passing: Vec::new(),
             cat_counts: [0; 6],
@@ -358,6 +453,9 @@ impl Session {
 
     pub fn add_files(&mut self, files: Vec<FoundFile>) {
         for f in files {
+            if !self.seen.is_empty() && self.seen.contains(&identity(&f)) {
+                continue;
+            }
             let dir = self.dirs.intern(&f.path);
             // Open the first two levels of the tree as they appear.
             let parent = self.dirs.nodes[dir as usize].parent;
@@ -410,9 +508,80 @@ impl Session {
     pub fn set_search(&mut self, search: &str) {
         let s = search.trim().to_lowercase();
         if s != self.search {
+            self.terms = parse_search(&s);
             self.search = s;
             self.rebuild_now();
         }
+    }
+
+    /// Is anything narrowing the list (besides the folder)?
+    pub fn filters_active(&self) -> bool {
+        self.cat.is_some()
+            || self.size_filter != SizeFilter::Any
+            || self.date_filter != DateFilter::Any
+            || self.chance_filter != ChanceFilter::Any
+    }
+
+    /// Back to "everything": all types, sizes, dates and ratings.
+    pub fn clear_filters(&mut self) {
+        self.cat = None;
+        self.size_filter = SizeFilter::Any;
+        self.date_filter = DateFilter::Any;
+        self.chance_filter = ChanceFilter::Any;
+        self.rebuild_now();
+    }
+
+    /// Remembers what is listed so that a continued scan adds only new entries.
+    pub fn begin_resume(&mut self) {
+        self.seen = self.files.iter().map(identity).collect();
+        self.finished = false;
+        self.stopped = false;
+        self.elapsed_secs = None;
+        self.started = Instant::now();
+        self.meter.reset();
+    }
+
+    /// Ticks or clears every shown file with this extension.
+    pub fn set_ext(&mut self, ext: &str, on: bool) {
+        for k in 0..self.visible.len() {
+            let i = self.visible[k] as usize;
+            if self.files[i].ext() == ext {
+                self.set_one(i, on);
+            }
+        }
+        self.recount_dirs();
+    }
+
+    /// The list as a CSV table (for a spreadsheet): the ticked files, or
+    /// everything shown when nothing is ticked. Returns the text and the
+    /// number of files in it.
+    pub fn csv(&self, tz: i32) -> (String, usize) {
+        let rows: Vec<u32> = if self.sel_count > 0 {
+            self.selected_indices()
+        } else {
+            self.visible.clone()
+        };
+        // The byte-order mark makes Excel read the names as UTF-8.
+        let mut out = String::from(
+            "\u{feff}Name,Folder,Size in bytes,Changed,Created,Status,Recoverability,Found through,Note\r\n",
+        );
+        for i in &rows {
+            let f = &self.files[*i as usize];
+            let line = [
+                csv_field(&f.name),
+                csv_field(&f.path),
+                f.size.to_string(),
+                csv_field(&crate::util::fmt_time(f.modified, tz)),
+                csv_field(&crate::util::fmt_time(f.created, tz)),
+                f.status.label().to_string(),
+                f.chance.label().to_string(),
+                csv_field(f.origin.label()),
+                csv_field(&f.note),
+            ];
+            out.push_str(&line.join(","));
+            out.push_str("\r\n");
+        }
+        (out, rows.len())
     }
 
     /// Rebuilds the visible list if something changed. While a scan is
@@ -447,7 +616,7 @@ impl Session {
                 || !self.size_filter.pass(f.size)
                 || !self.date_filter.pass(f.modified, self.now)
                 || !self.chance_filter.pass(f.chance)
-                || (!self.search.is_empty() && !f.name.to_lowercase().contains(&self.search))
+                || !matches_search(&self.terms, &f.name)
             {
                 continue;
             }
@@ -658,6 +827,54 @@ impl Session {
             .unwrap_or(0)
             .clamp(0, self.visible.len() as i64 - 1);
         self.highlighted = Some(self.visible[pos as usize]);
+        self.scroll_to_highlight = true;
+    }
+
+    /// Moves the highlight to the first or the last file shown.
+    pub fn jump_highlight(&mut self, last: bool) {
+        if let Some(i) = if last {
+            self.visible.last()
+        } else {
+            self.visible.first()
+        } {
+            self.highlighted = Some(*i);
+            self.scroll_to_highlight = true;
+        }
+    }
+
+    /// Position of the highlighted file in the list that is shown.
+    pub fn highlighted_row(&self) -> Option<usize> {
+        let h = self.highlighted?;
+        self.visible.iter().position(|v| *v == h)
+    }
+}
+
+/// A number that stands for one listed entry: same file, same number.
+fn identity(f: &FoundFile) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    f.name.hash(&mut h);
+    f.path.hash(&mut h);
+    f.size.hash(&mut h);
+    f.modified.hash(&mut h);
+    f.origin.hash(&mut h);
+    f.first_offset().hash(&mut h);
+    h.finish()
+}
+
+/// The new scroll position that brings a row into view, if it is not
+/// already visible. `top`..`top + size` is the row, `offset` and `height`
+/// describe what is shown now.
+pub fn scroll_into_view(top: f32, size: f32, offset: f32, height: f32) -> Option<f32> {
+    if height <= 0.0 {
+        return None;
+    }
+    if top < offset {
+        Some(top)
+    } else if top + size > offset + height {
+        Some((top + size - height).max(0.0))
+    } else {
+        None
     }
 }
 
@@ -896,6 +1113,122 @@ mod tests {
         assert_eq!(s.sel_count, 5);
         assert_eq!(s.visible.len(), 5);
         assert!(!names(&s).iter().any(|n| n.starts_with("recovered")));
+    }
+
+    #[test]
+    fn search_words_and_patterns() {
+        let mut s = session();
+        s.set_search("*.jpg");
+        assert_eq!(names(&s), ["A.jpg", "b.jpg"]);
+        s.set_search("*.JP? b");
+        assert_eq!(names(&s), ["b.jpg"]);
+        s.set_search("re pdf");
+        assert_eq!(names(&s), ["report.pdf"], "every word has to match");
+        s.set_search("?.png");
+        assert_eq!(names(&s), ["c.png"]);
+        s.set_search("*");
+        assert_eq!(s.visible.len(), 5);
+        s.set_search("song.mp3 nothing");
+        assert!(s.visible.is_empty());
+        let p = |t: &str| t.chars().collect::<Vec<char>>();
+        assert!(glob(&p("a*b*c"), &p("aXXbYYc")));
+        assert!(glob(&p("*"), &p("")));
+        assert!(!glob(&p("a*b"), &p("ab c")));
+        assert!(!glob(&p("?"), &p("")));
+        assert!(glob(&p("ڕاپۆرت*.pdf"), &p("ڕاپۆرتی ساڵانە.pdf")));
+    }
+
+    #[test]
+    fn clearing_filters_and_ticking_by_type() {
+        let mut s = session();
+        assert!(!s.filters_active());
+        s.cat = Some(Category::Audio);
+        s.size_filter = SizeFilter::Under1Mb;
+        s.rebuild_now();
+        assert!(s.filters_active());
+        assert!(s.visible.is_empty());
+        s.clear_filters();
+        assert!(!s.filters_active());
+        assert_eq!(s.visible.len(), 5);
+        s.set_ext("jpg", true);
+        assert_eq!((s.sel_count, s.sel_bytes), (2, 2_000_500));
+        s.set_ext("jpg", false);
+        assert_eq!(s.sel_count, 0);
+    }
+
+    #[test]
+    fn csv_lists_the_ticked_files_or_everything_shown() {
+        let mut s = session();
+        let mut odd = file(
+            "=cmd, \"x\".txt",
+            "Docs",
+            7,
+            0,
+            Chance::Good,
+            Status::Deleted,
+        );
+        odd.note = "two\nlines".into();
+        s.add_files(vec![odd]);
+        s.rebuild_now();
+        let (all, n) = s.csv(0);
+        assert_eq!(n, 6);
+        assert!(all.starts_with("\u{feff}Name,Folder,Size in bytes,"));
+        assert_eq!(all.matches("\r\n").count(), 7);
+        // Quoted, quotes doubled, and no formula for a spreadsheet to run.
+        assert!(all.contains(
+            "\"'=cmd, \"\"x\"\".txt\",Docs,7,,,Deleted,Good,NTFS file record,\"two\nlines\"\r\n"
+        ));
+        assert!(all.contains("report.pdf,Docs/Work,209715200,"));
+        let i = s.visible[0];
+        s.toggle(i);
+        let (some, n) = s.csv(0);
+        assert_eq!(n, 1);
+        assert_eq!(some.matches("\r\n").count(), 2);
+    }
+
+    #[test]
+    fn a_continued_scan_does_not_list_entries_twice() {
+        let mut s = session();
+        s.finished = true;
+        s.stopped = true;
+        let before = s.files.len();
+        s.set_visible(true);
+        let ticked = s.sel_count;
+        s.begin_resume();
+        assert!(!s.finished && !s.stopped);
+        // The continued scan reads the file table again...
+        let again: Vec<FoundFile> = s.files.clone();
+        s.add_files(again);
+        assert_eq!(s.files.len(), before);
+        // ...and finds new things further on.
+        s.add_files(vec![file(
+            "recovered-000000900.jpg",
+            "Found by content/Pictures/JPG",
+            900,
+            0,
+            Chance::Good,
+            Status::Deleted,
+        )]);
+        assert_eq!(s.files.len(), before + 1);
+        assert_eq!(s.sel_count, ticked, "ticks are kept");
+    }
+
+    #[test]
+    fn keyboard_moves_bring_rows_into_view() {
+        let mut s = session();
+        assert_eq!(s.highlighted_row(), None);
+        s.jump_highlight(true);
+        assert_eq!(s.highlighted_row(), Some(s.visible.len() - 1));
+        assert!(s.scroll_to_highlight);
+        s.jump_highlight(false);
+        assert_eq!(s.highlighted_row(), Some(0));
+        s.step_highlight(3);
+        assert_eq!(s.highlighted_row(), Some(3));
+        // Row 10 of 36-point rows in a 300-point view scrolled to 0.
+        assert_eq!(scroll_into_view(360.0, 36.0, 0.0, 300.0), Some(96.0));
+        assert_eq!(scroll_into_view(36.0, 36.0, 100.0, 300.0), Some(36.0));
+        assert_eq!(scroll_into_view(150.0, 36.0, 100.0, 300.0), None);
+        assert_eq!(scroll_into_view(150.0, 36.0, 100.0, 0.0), None);
     }
 
     #[test]

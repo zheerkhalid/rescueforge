@@ -5,7 +5,7 @@
 //! zlib-compressed JSON.
 
 use crate::model::{FoundFile, SourceSpec};
-use crate::scan::ScanOptions;
+use crate::scan::{ResumePoint, ScanOptions};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -28,6 +28,9 @@ pub struct Session {
     pub finished: bool,
     pub files: Vec<FoundFile>,
     pub log: Vec<String>,
+    /// Where a deep scan that was stopped early can be continued.
+    #[serde(default)]
+    pub resume: Option<ResumePoint>,
 }
 
 impl Session {
@@ -103,6 +106,12 @@ mod tests {
                 })
                 .collect(),
             log: vec!["This volume: NTFS file system, 500 entries listed.".into()],
+            resume: Some(ResumePoint {
+                pos: 256 << 20,
+                skip_until: 300 << 20,
+                lost: vec![1 << 20],
+                listed: 500,
+            }),
         }
     }
 
@@ -117,6 +126,27 @@ mod tests {
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size < 40_000, "compressed: {size} bytes");
         assert_eq!(Session::load(&path).unwrap(), s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sessions_of_the_first_version_still_open() {
+        // What 1.0 wrote: no "resume" at all, and scan options without it.
+        let json = br#"{"created":1,"source":"Demo","source_label":"Old","source_len":512,
+            "options":{"deep":true,"free_only":true,"find_partitions":true,
+            "include_existing":false,"carve_off":["txt"],"tz":0},
+            "finished":false,"files":[],"log":["line"]}"#;
+        let mut raw = MAGIC.to_vec();
+        raw.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(json, 6));
+        let dir =
+            std::env::temp_dir().join(format!("rescueforge-session-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.rfsession");
+        std::fs::write(&path, raw).unwrap();
+        let s = Session::load(&path).unwrap();
+        assert_eq!(s.resume, None);
+        assert_eq!(s.options.resume, None);
+        assert!(s.options.deep && !s.finished);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

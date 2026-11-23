@@ -1,7 +1,7 @@
 ; RescueForge installer (Inno Setup 6).
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
 #endif
 ; Where cargo put the build ("target" in the project unless CARGO_TARGET_DIR says otherwise).
 #ifndef TargetDir

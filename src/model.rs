@@ -44,17 +44,17 @@ impl Category {
             "jpg" | "jpeg" | "jpe" | "png" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "heic"
             | "heif" | "avif" | "psd" | "psb" | "cr2" | "cr3" | "nef" | "arw" | "dng" | "orf"
             | "rw2" | "pef" | "srw" | "raf" | "raw" | "ico" | "svg" | "ai" | "eps" | "jfif"
-            | "djvu" | "xcf" => Category::Pictures,
+            | "djvu" | "xcf" | "jp2" | "j2k" | "emf" | "cur" => Category::Pictures,
             "mp4" | "mov" | "m4v" | "3gp" | "3g2" | "avi" | "mkv" | "webm" | "wmv" | "asf"
             | "flv" | "mpg" | "mpeg" | "ts" | "m2ts" | "mts" | "ogv" | "vob" => Category::Video,
             "mp3" | "wav" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "wma" | "aac" | "aif"
-            | "aiff" | "mid" | "midi" | "amr" | "ape" => Category::Audio,
+            | "aiff" | "mid" | "midi" | "amr" | "ape" | "dsf" | "wv" | "au" => Category::Audio,
             "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "rtf" | "txt" | "xml"
             | "html" | "htm" | "odt" | "ods" | "odp" | "csv" | "md" | "epub" | "msg" | "vsd"
             | "vsdx" | "pst" | "ost" | "json" | "log" | "ole" | "pub" | "one" | "mdb" | "accdb"
-            | "eml" | "plist" | "kml" | "gpx" => Category::Documents,
+            | "eml" | "plist" | "kml" | "gpx" | "vcf" | "ics" => Category::Documents,
             "zip" | "rar" | "7z" | "gz" | "tgz" | "tar" | "xz" | "bz2" | "cab" | "jar" | "apk"
-            | "iso" | "img" | "vhd" | "vhdx" => Category::Archives,
+            | "iso" | "img" | "vhd" | "vhdx" | "zst" | "lz4" | "deb" => Category::Archives,
             _ => Category::Other,
         }
     }
@@ -253,6 +253,19 @@ mod tests {
         assert_eq!(Category::from_ext("xlsx"), Category::Documents);
         assert_eq!(Category::from_ext("7z"), Category::Archives);
         assert_eq!(Category::from_ext("exe"), Category::Other);
+        assert_eq!(Category::from_ext("jp2"), Category::Pictures);
+        assert_eq!(Category::from_ext("cur"), Category::Pictures);
+        assert_eq!(Category::from_ext("wv"), Category::Audio);
+        assert_eq!(Category::from_ext("mpg"), Category::Video);
+        assert_eq!(Category::from_ext("vcf"), Category::Documents);
+        assert_eq!(Category::from_ext("ics"), Category::Documents);
+        assert_eq!(Category::from_ext("zst"), Category::Archives);
+        assert_eq!(Category::from_ext("deb"), Category::Archives);
+        for other in [
+            "ttf", "woff2", "swf", "a", "hve", "evtx", "elf", "pcap", "lnk",
+        ] {
+            assert_eq!(Category::from_ext(other), Category::Other, "{other}");
+        }
         assert_eq!(Category::from_ext(""), Category::Other);
         for (i, c) in Category::ALL.iter().enumerate() {
             assert_eq!(c.index(), i);

@@ -9,9 +9,10 @@ const USAGE: &str = "RescueForge
   RescueForge.exe                      open the program
   RescueForge.exe --demo               show an invented disk; nothing on this PC is read
   RescueForge.exe --screenshot <png>   render the window to a PNG and exit (use with --demo)
-        [--view home|home-quick|scanning|results|preview|preview-text|bigpreview|grid|
-                recover|recover-blocked|recover-running|recover-done|images|imaging|log|
-                settings|welcome|shortcuts|about] [--light]
+        [--view home|home-quick|scanning|stopped|results|preview|preview-text|
+                bigpreview|preview-doc|kurdish|kurdish-text|grid|recover|recover-blocked|
+                recover-running|recover-done|images|imaging|log|settings|welcome|
+                shortcuts|about] [--light]
         (the view can also be set with the RESCUEFORGE_VIEW environment variable)
   RescueForge.exe <image> [--deep]     open a disk image and scan it right away
   RescueForge.exe --selftest           build disk images in a temp folder, delete files in

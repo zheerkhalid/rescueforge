@@ -1,6 +1,6 @@
 [package]
 name = "rescueforge"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "File recovery for Windows: quick and deep scans for deleted files, lost partitions and disk images"
 authors = ["Zheer Khalid (https://zheer.dev)"]
@@ -34,6 +34,8 @@ miniz_oxide = "0.8"
 version = "0.58"
 features = [
     "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",

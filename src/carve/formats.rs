@@ -1919,3 +1919,1067 @@ pub fn pe(w: &mut Win) -> Option<Hit> {
     };
     hit(end, ext)
 }
+
+/// Linux programs and libraries (little-endian ELF): the file reaches as far
+/// as its last segment, section or header table.
+pub fn elf(w: &mut Win) -> Option<Hit> {
+    const MAX: u64 = 4 << 30;
+    let h = w.get(0, 64)?.to_vec();
+    let wide = match h[4] {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    if h[5] != 1
+        || h[6] != 1
+        || !(1..=4).contains(&le16(&h, 16)?)
+        || le16(&h, 18)? == 0
+        || le32(&h, 20)? != 1
+    {
+        return None;
+    }
+    let (phoff, shoff, at) = if wide {
+        (le64(&h, 32)?, le64(&h, 40)?, 52)
+    } else {
+        (le32(&h, 28)? as u64, le32(&h, 32)? as u64, 40)
+    };
+    let ehsize = le16(&h, at)? as u64;
+    let phentsize = le16(&h, at + 2)? as usize;
+    let phnum = le16(&h, at + 4)? as usize;
+    let shentsize = le16(&h, at + 6)? as usize;
+    let shnum = le16(&h, at + 8)? as usize;
+    let (eh, ph, sh) = if wide { (64, 56, 64) } else { (52, 32, 40) };
+    if ehsize != eh
+        || (phnum != 0 && phentsize != ph)
+        || (shnum != 0 && shentsize != sh)
+        || (phnum == 0 && shnum == 0)
+    {
+        return None;
+    }
+    let mut end = ehsize;
+    if phnum > 0 {
+        if phoff < eh {
+            return None;
+        }
+        let table = w.get(phoff, phnum * ph)?.to_vec();
+        end = end.max(phoff + (phnum * ph) as u64);
+        for p in table.chunks_exact(ph) {
+            let (off, size) = if wide {
+                (le64(p, 8)?, le64(p, 32)?)
+            } else {
+                (le32(p, 4)? as u64, le32(p, 16)? as u64)
+            };
+            if size > 0 {
+                end = end.max(off.checked_add(size)?);
+            }
+        }
+    }
+    if shnum > 0 {
+        if shoff < eh {
+            return None;
+        }
+        let table = w.get(shoff, shnum * sh)?.to_vec();
+        end = end.max(shoff + (shnum * sh) as u64);
+        for s in table.chunks_exact(sh) {
+            let (off, size) = if wide {
+                (le64(s, 24)?, le64(s, 32)?)
+            } else {
+                (le32(s, 16)? as u64, le32(s, 20)? as u64)
+            };
+            // Unused entries and sections without bytes in the file (.bss) do not count.
+            if !matches!(le32(s, 4)?, 0 | 8) && size > 0 {
+                end = end.max(off.checked_add(size)?);
+            }
+        }
+    }
+    if end > MAX {
+        return None;
+    }
+    hit(end, "elf")
+}
+
+// ------------------------------------------------------------------------------------
+// Fonts
+// ------------------------------------------------------------------------------------
+
+/// TrueType and OpenType: the table directory says where every table lies.
+pub fn sfnt(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 12)?;
+    let ext = match &h[..4] {
+        [0, 1, 0, 0] => "ttf",
+        b"OTTO" => "otf",
+        _ => return None,
+    };
+    let tables = be16(h, 4)? as usize;
+    if !(4..=64).contains(&tables) {
+        return None;
+    }
+    let first = 12 + tables as u64 * 16;
+    let dir = w.get(12, tables * 16)?;
+    let mut end = first;
+    let mut head = false;
+    let mut known = false;
+    for t in dir.chunks_exact(16) {
+        let tag = &t[..4];
+        let (off, len) = (be32(t, 8)? as u64, be32(t, 12)? as u64);
+        if !tag.iter().all(|c| (0x20..0x7F).contains(c))
+            || off < first
+            || !off.is_multiple_of(4)
+            || len > 1 << 30
+        {
+            return None;
+        }
+        match tag {
+            // The font header table has one fixed length.
+            b"head" if len == 54 => head = true,
+            b"head" => return None,
+            b"cmap" | b"glyf" | b"name" | b"maxp" | b"CFF " | b"CFF2" => known = true,
+            _ => {}
+        }
+        end = end.max(off + len);
+    }
+    if !head || !known {
+        return None;
+    }
+    // Tables are padded with zeros to four bytes; a few fonts leave that out
+    // after their last table.
+    let padded = end.div_ceil(4) * 4;
+    let is_padded = w
+        .get(end, (padded - end) as usize)
+        .is_some_and(|p| p.iter().all(|b| *b == 0));
+    hit(if is_padded { padded } else { end }, ext)
+}
+
+/// Web fonts (WOFF and WOFF2) store their total length in the header.
+pub fn woff(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 48)?;
+    let two = match &h[..4] {
+        b"wOFF" => false,
+        b"wOF2" => true,
+        _ => return None,
+    };
+    if !matches!(&h[4..8], [0, 1, 0, 0] | b"OTTO" | b"true" | b"ttcf") {
+        return None;
+    }
+    let len = be32(h, 8)? as u64;
+    let tables = be16(h, 12)? as u64;
+    let directory = if two { 48 + tables } else { 44 + tables * 20 };
+    if tables == 0 || tables > 4096 || be16(h, 14)? != 0 || be32(h, 16)? < 12 || len <= directory {
+        return None;
+    }
+    if two {
+        let compressed = be32(h, 20)? as u64;
+        if compressed == 0 || compressed >= len {
+            return None;
+        }
+        hit(len, "woff2")
+    } else {
+        // The optional metadata and private blocks lie inside the file.
+        for at in [24, 36] {
+            let (off, size) = (be32(h, at)? as u64, be32(h, at + 4)? as u64);
+            if (off == 0) != (size == 0) || off + size > len {
+                return None;
+            }
+        }
+        hit(len, "woff")
+    }
+}
+
+// ------------------------------------------------------------------------------------
+// More pictures: JPEG 2000, DjVu, metafiles, icons
+// ------------------------------------------------------------------------------------
+
+/// Offset just past the first occurrence of `needle` in `[from, end)`.
+/// ASCII letters match in either case; other bytes must be equal.
+fn find_first_ci(w: &mut Win, from: u64, end: u64, needle: &[u8]) -> Option<u64> {
+    let mut pos = from;
+    let overlap = needle.len() as u64 - 1;
+    while pos < end {
+        let want = ((end - pos) as usize).min(1 << 16);
+        let chunk = w.some(pos, want);
+        if chunk.len() < needle.len() {
+            break;
+        }
+        if let Some(i) = chunk
+            .windows(needle.len())
+            .position(|x| x.eq_ignore_ascii_case(needle))
+        {
+            return Some(pos + (i + needle.len()) as u64);
+        }
+        if chunk.len() < want || pos + chunk.len() as u64 >= end {
+            break;
+        }
+        pos += chunk.len() as u64 - overlap;
+    }
+    None
+}
+
+/// Walks a JPEG 2000 codestream that starts at `start` and returns the
+/// offset just past its end-of-codestream marker.
+fn j2k_end(w: &mut Win, start: u64, max: u64) -> Option<u64> {
+    let siz = w.get(start, 42)?;
+    let components = be16(siz, 40)? as u32;
+    if siz[..4] != [0xFF, 0x4F, 0xFF, 0x51]
+        || !(1..=16_384).contains(&components)
+        || be16(siz, 4)? as u32 != 38 + 3 * components
+        || be32(siz, 8)? == 0
+        || be32(siz, 12)? == 0
+    {
+        return None;
+    }
+    let cap = w.limit().min(start.saturating_add(max));
+    // The main header: marker segments up to the first tile part.
+    let mut pos = start + 2;
+    for _ in 0..4096 {
+        let m = w.get(pos, 4)?;
+        if m[0] != 0xFF {
+            return None;
+        }
+        match m[1] {
+            0x90 => break,
+            0x50..=0x7F => {
+                let len = be16(m, 2)? as u64;
+                if len < 2 {
+                    return None;
+                }
+                pos += 2 + len;
+            }
+            _ => return None,
+        }
+    }
+    // Tile parts, each with its own length, then the end marker.
+    loop {
+        let t = w.get(pos, 12)?;
+        if t[..4] != [0xFF, 0x90, 0x00, 0x0A] {
+            return None;
+        }
+        let len = be32(t, 6)? as u64;
+        if len == 0 {
+            // The last tile part may leave its length open: it runs up to the end marker.
+            return find_first_ci(w, pos + 12, cap, &[0xFF, 0xD9]);
+        }
+        if len < 14 {
+            return None;
+        }
+        pos += len;
+        if pos > cap {
+            return None;
+        }
+        let next = w.get(pos, 2)?;
+        if next == [0xFF, 0xD9] {
+            return Some(pos + 2);
+        }
+    }
+}
+
+pub const JP2_SIGNATURE: [u8; 12] = [
+    0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+];
+
+/// JPEG 2000 in its box container: the picture ends with the codestream box.
+pub fn jp2(w: &mut Win) -> Option<Hit> {
+    const MAX: u64 = 4 << 30;
+    let f = w.get(12, 12)?;
+    if &f[4..8] != b"ftyp" || !matches!(&f[8..12], b"jp2 " | b"jpx ") {
+        return None;
+    }
+    let mut pos = 12u64;
+    for _ in 0..4096 {
+        let h = w.get(pos, 8)?;
+        let mut size = be32(h, 0)? as u64;
+        let ty = [h[4], h[5], h[6], h[7]];
+        if !ty.iter().all(|c| (0x20..0x7F).contains(c)) {
+            return None;
+        }
+        let mut header = 8u64;
+        if size == 1 {
+            size = w.be64(pos + 8)?;
+            header = 16;
+        }
+        if &ty == b"jp2c" {
+            let data = pos + header;
+            if size == 0 {
+                // "Up to the end of the file": the codestream itself says where that is.
+                return hit(j2k_end(w, data, MAX)?, "jp2");
+            }
+            if size < header + 4 || size > MAX || w.get(data, 2)? != [0xFF, 0x4F] {
+                return None;
+            }
+            return hit(pos + size, "jp2");
+        }
+        if size < header {
+            return None;
+        }
+        pos = pos.checked_add(size)?;
+        if pos > MAX {
+            return None;
+        }
+    }
+    None
+}
+
+/// A bare JPEG 2000 codestream without the box container.
+pub fn j2k(w: &mut Win) -> Option<Hit> {
+    hit(j2k_end(w, 0, 4 << 30)?, "j2k")
+}
+
+pub fn djvu(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 16)?;
+    let len = be32(h, 8)? as u64;
+    if &h[..8] != b"AT&TFORM" || !matches!(&h[12..16], b"DJVU" | b"DJVM" | b"DJVI") || len < 16 {
+        return None;
+    }
+    hit(len + 12, "djvu")
+}
+
+/// Enhanced metafile: the header record holds the size of the whole file.
+pub fn emf(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 88)?;
+    let header = le32(h, 4)? as u64;
+    let bytes = le32(h, 48)? as u64;
+    let records = le32(h, 52)? as u64;
+    if le32(h, 0)? != 1
+        || &h[40..44] != b" EMF"
+        || le32(h, 44)? != 0x1_0000
+        || !(88..=4096).contains(&header)
+        || !header.is_multiple_of(4)
+        || le16(h, 58)? != 0
+        || !bytes.is_multiple_of(4)
+        || bytes < header + 20
+        || records < 2
+        || records > (bytes - header) / 8 + 1
+    {
+        return None;
+    }
+    // The last record is the end-of-file record, which repeats its own size at its end.
+    let last = w.le32(bytes - 4)? as u64;
+    if last < 20 || !last.is_multiple_of(4) || last > bytes - header {
+        return None;
+    }
+    let eof = w.get(bytes - last, 8)?;
+    if le32(eof, 0)? != 14 || le32(eof, 4)? as u64 != last {
+        return None;
+    }
+    hit(bytes, "emf")
+}
+
+/// Icons and cursors: a directory of pictures, each a PNG or a bitmap.
+pub fn ico(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 6)?;
+    let cursor = match le16(h, 2)? {
+        1 => false,
+        2 => true,
+        _ => return None,
+    };
+    let count = le16(h, 4)? as usize;
+    if le16(h, 0)? != 0 || !(1..=64).contains(&count) {
+        return None;
+    }
+    let dir = w.get(6, count * 16)?.to_vec();
+    let first = 6 + count as u64 * 16;
+    let mut end = first;
+    for e in dir.chunks_exact(16) {
+        let (a, b) = (le16(e, 4)?, le16(e, 6)?);
+        let (size, off) = (le32(e, 8)? as u64, le32(e, 12)? as u64);
+        // Icons: colour planes and bits per pixel. Cursors: the hot spot.
+        let fields_ok = if cursor {
+            a < 256 && b < 256
+        } else {
+            a <= 1 && [0, 1, 4, 8, 16, 24, 32].contains(&b)
+        };
+        if e[3] != 0 || !fields_ok || off < first || !(40..=16 << 20).contains(&size) {
+            return None;
+        }
+        let p = w.get(off, 16)?;
+        let png = p.starts_with(b"\x89PNG\r\n\x1a\n");
+        let bitmap = le32(p, 0)? == 40 && (1..=1024).contains(&le32(p, 4)?) && le16(p, 12)? == 1;
+        if !png && !bitmap {
+            return None;
+        }
+        end = end.max(off + size);
+    }
+    hit(end, if cursor { "cur" } else { "ico" })
+}
+
+// ------------------------------------------------------------------------------------
+// More audio and video
+// ------------------------------------------------------------------------------------
+
+/// Length of an APE tag that starts (with its header) at `pos`; 0 if there is none.
+fn ape_tag(w: &mut Win, pos: u64) -> u64 {
+    let limit = w.limit();
+    match w.get(pos, 32) {
+        Some(t) if &t[..8] == b"APETAGEX" => {
+            let size = le32(t, 12).unwrap_or(0) as u64;
+            let flags = le32(t, 20).unwrap_or(0);
+            // Bit 29 marks this block as the header; the size counts the items and the footer.
+            if flags & 0x2000_0000 != 0
+                && (32..16 << 20).contains(&size)
+                && pos + 32 + size <= limit
+            {
+                32 + size
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// DSD audio (DSF): the first chunk holds the size of the whole file.
+pub fn dsf(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 40)?;
+    let total = le64(h, 12)?;
+    let metadata = le64(h, 20)?;
+    if &h[..4] != b"DSD "
+        || le64(h, 4)? != 28
+        || &h[28..32] != b"fmt "
+        || le64(h, 32)? != 52
+        || !(92..=64 << 30).contains(&total)
+        || (metadata != 0 && !(92..total).contains(&metadata))
+    {
+        return None;
+    }
+    hit(total, "dsf")
+}
+
+/// WavPack: a chain of blocks, each with its own length.
+pub fn wavpack(w: &mut Win) -> Option<Hit> {
+    const MAX: u64 = 64 << 30;
+    let mut pos = 0u64;
+    let mut blocks = 0u64;
+    let mut last_index = 0u64;
+    while let Some(h) = w.get(pos, 32) {
+        let size = le32(h, 4)? as u64;
+        if &h[..4] != b"wvpk"
+            || !(0x402..=0x410).contains(&le16(h, 8)?)
+            || !(24..=4 << 20).contains(&size)
+        {
+            break;
+        }
+        // A block that counts its samples from an earlier point belongs to the next file.
+        let index = (h[10] as u64) << 32 | le32(h, 16)? as u64;
+        if (blocks > 0 && index < last_index) || pos + 8 + size > w.limit() {
+            break;
+        }
+        last_index = index;
+        pos += 8 + size;
+        blocks += 1;
+        if pos > MAX {
+            return None;
+        }
+    }
+    if blocks == 0 {
+        return None;
+    }
+    pos += ape_tag(w, pos);
+    hit(pos, "wv")
+}
+
+/// AMR speech (narrow and wide band): frames whose length follows from
+/// their first byte. The file ends at the first byte that cannot start a frame.
+pub fn amr(w: &mut Win) -> Option<Hit> {
+    const MAX: u64 = 1 << 30;
+    // Frame lengths (with the header byte) by frame type; 0 = not a valid type.
+    const NARROW: [u8; 16] = [13, 14, 16, 18, 20, 21, 27, 32, 6, 0, 0, 0, 0, 0, 0, 1];
+    const WIDE: [u8; 16] = [18, 24, 33, 37, 41, 47, 51, 59, 61, 6, 0, 0, 0, 0, 1, 1];
+    let h = w.get(0, 9)?;
+    let (mut pos, sizes) = if h.starts_with(b"#!AMR\n") {
+        (6u64, &NARROW)
+    } else if h.starts_with(b"#!AMR-WB\n") {
+        (9u64, &WIDE)
+    } else {
+        return None;
+    };
+    let mut frames = 0u32;
+    while let Some(b) = w.u8(pos) {
+        let len = sizes[(b >> 3 & 15) as usize] as u64;
+        if b & 0x83 != 0 || len == 0 || pos + len > w.limit() {
+            break;
+        }
+        // Blank space after the file would otherwise pass as a row of frames.
+        if b == 0 && w.get(pos, len as usize)?.iter().all(|x| *x == 0) {
+            break;
+        }
+        pos += len;
+        frames += 1;
+        if pos > MAX {
+            return None;
+        }
+    }
+    if frames < 10 {
+        return None;
+    }
+    hit(pos, "amr")
+}
+
+/// Sun / NeXT audio: header size and data size are both in the header.
+pub fn au(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 24)?;
+    let header = be32(h, 4)? as u64;
+    let data = be32(h, 8)? as u64;
+    if &h[..4] != b".snd"
+        || !(24..=1 << 20).contains(&header)
+        || data == 0
+        // "Unknown length", as written by programs that stream their output.
+        || data == 0xFFFF_FFFF
+        || !(1..=27).contains(&be32(h, 12)?)
+        || !(100..=768_000).contains(&be32(h, 16)?)
+        || !(1..=256).contains(&be32(h, 20)?)
+    {
+        return None;
+    }
+    hit(header + data, "au")
+}
+
+/// Monkey's Audio from version 3.98 on: the descriptor lists the length of every part.
+pub fn ape(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 52)?;
+    let version = le16(h, 4)?;
+    let descriptor = le32(h, 8)? as u64;
+    let header = le32(h, 12)? as u64;
+    let seek_table = le32(h, 16)? as u64;
+    let wav_header = le32(h, 20)? as u64;
+    let frames = (le32(h, 28)? as u64) << 32 | le32(h, 24)? as u64;
+    let terminating = le32(h, 32)? as u64;
+    if &h[..4] != b"MAC "
+        || !(3980..=4999).contains(&version)
+        || !(52..=4096).contains(&descriptor)
+        || !(24..=4096).contains(&header)
+        || !seek_table.is_multiple_of(4)
+        || frames == 0
+        || frames > 64 << 30
+    {
+        return None;
+    }
+    let mut end = descriptor + header + seek_table + wav_header + frames + terminating;
+    if end > w.limit() {
+        return None;
+    }
+    end += ape_tag(w, end);
+    hit(end, "ape")
+}
+
+/// MPEG program stream (MPG, VOB): packs and packets, each introduced by a
+/// start code. Ends with the program end code, or where the chain breaks.
+pub fn mpeg_ps(w: &mut Win) -> Option<Hit> {
+    const MAX: u64 = 64 << 30;
+    let mut pos = 0u64;
+    let mut packs = 0u64;
+    let mut packets = 0u64;
+    while let Some(h) = w.get(pos, 4) {
+        if h[..3] != [0, 0, 1] {
+            break;
+        }
+        let next = match h[3] {
+            0xB9 => {
+                pos += 4;
+                break;
+            }
+            0xBA => {
+                let Some(p) = w.get(pos, 14) else {
+                    break;
+                };
+                // The fixed marker bits tell the two generations of pack header apart.
+                let mpeg2 = p[4] & 0xC4 == 0x44
+                    && p[6] & 4 != 0
+                    && p[8] & 4 != 0
+                    && p[9] & 1 != 0
+                    && p[12] & 3 == 3;
+                let mpeg1 = p[4] & 0xF1 == 0x21
+                    && p[6] & 1 != 0
+                    && p[8] & 1 != 0
+                    && p[9] & 0x80 != 0
+                    && p[11] & 1 != 0;
+                let stuffing = (p[13] & 7) as u64;
+                if !mpeg2 && !mpeg1 {
+                    break;
+                }
+                packs += 1;
+                if mpeg2 {
+                    pos + 14 + stuffing
+                } else {
+                    pos + 12
+                }
+            }
+            0xBB..=0xFF => {
+                let Some(len) = w.be16(pos + 4) else {
+                    break;
+                };
+                packets += 1;
+                pos + 6 + len as u64
+            }
+            _ => break,
+        };
+        if next > w.limit() {
+            break;
+        }
+        pos = next;
+        if pos > MAX {
+            return None;
+        }
+    }
+    // A few start codes in a row happen by chance; a recording has many.
+    if packs < 4 || packets < 4 {
+        return None;
+    }
+    hit(pos, "mpg")
+}
+
+/// Flash (uncompressed): the header holds the length of the file.
+pub fn swf(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 30)?;
+    let len = le32(h, 4)? as u64;
+    if &h[..3] != b"FWS" || !(1..=45).contains(&h[3]) {
+        return None;
+    }
+    // The stage rectangle: a 5-bit field width, then four values of that many bits.
+    let width = (h[8] >> 3) as usize;
+    let field = |n: usize| -> u32 {
+        (5 + n * width..5 + (n + 1) * width).fold(0u32, |v, bit| {
+            v << 1 | (h[8 + bit / 8] >> (7 - bit % 8) & 1) as u32
+        })
+    };
+    if width < 2 || field(0) != 0 || field(2) != 0 {
+        return None;
+    }
+    let (x, y) = (field(1), field(3));
+    if x == 0 || y == 0 || x >> (width - 1) != 0 || y >> (width - 1) != 0 {
+        return None;
+    }
+    let after = 8 + (5 + 4 * width).div_ceil(8);
+    let rate = le16(h, after)?;
+    if rate == 0 || rate > 120 << 8 || le16(h, after + 2)? == 0 || len < after as u64 + 6 {
+        return None;
+    }
+    // The last tag of every movie is the two-byte end tag.
+    if w.get(len - 2, 2)? != [0, 0] {
+        return None;
+    }
+    hit(len, "swf")
+}
+
+// ------------------------------------------------------------------------------------
+// More archives: Zstandard, LZ4, ar
+// ------------------------------------------------------------------------------------
+
+/// Does a compressed Zstandard block of `size` bytes begin with a literals
+/// section that fits inside it? `b` holds the first bytes of the block.
+fn zstd_literals_fit(b: &[u8], size: u64) -> bool {
+    let Some(&first) = b.first() else {
+        return false;
+    };
+    let byte = |i: usize| b.get(i).copied().unwrap_or(0) as u64;
+    let format = first >> 2 & 3;
+    let (header, unpacked, stored) = if first & 3 < 2 {
+        // Raw or run-length literals: only the unpacked size is given.
+        let (header, unpacked) = match format {
+            0 | 2 => (1, byte(0) >> 3),
+            1 => (2, byte(0) >> 4 | byte(1) << 4),
+            _ => (3, byte(0) >> 4 | byte(1) << 4 | byte(2) << 12),
+        };
+        (header, unpacked, if first & 3 == 0 { unpacked } else { 1 })
+    } else {
+        // Packed literals: unpacked and stored size, with the same number of bits each.
+        let (header, bits) = match format {
+            0 | 1 => (3, 10),
+            2 => (4, 14),
+            _ => (5, 18),
+        };
+        let v = (0..5).fold(0u64, |v, i| v | byte(i) << (8 * i));
+        let mask = (1u64 << bits) - 1;
+        (header, v >> 4 & mask, v >> (4 + bits) & mask)
+    };
+    // At least one byte of sequences follows the literals.
+    unpacked <= 128 << 10 && header + stored < size
+}
+
+/// The end of one Zstandard frame that starts at `start`.
+fn zstd_frame(w: &mut Win, start: u64) -> Option<u64> {
+    let d = w.u8(start + 4)?;
+    if d & 0x08 != 0 {
+        return None;
+    }
+    let single = d & 0x20 != 0;
+    let dict = [0u64, 1, 2, 4][(d & 3) as usize];
+    let content_size = match d >> 6 {
+        0 => single as u64,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let mut pos = start + 5 + !single as u64 + dict + content_size;
+    loop {
+        let b = w.get(pos, 3)?;
+        let v = b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16;
+        let size = (v >> 3) as u64;
+        let body = match v >> 1 & 3 {
+            0 => size,
+            // One byte, repeated `size` times when unpacked.
+            1 => 1,
+            2 if size > 0 => size,
+            _ => return None,
+        };
+        if size > 128 << 10 || (v >> 1 & 3 == 2 && !zstd_literals_fit(w.some(pos + 3, 5), size)) {
+            return None;
+        }
+        pos += 3 + body;
+        if pos > w.limit() {
+            return None;
+        }
+        if v & 1 != 0 {
+            break;
+        }
+    }
+    if d & 0x04 != 0 {
+        pos += 4;
+    }
+    (pos <= w.limit()).then_some(pos)
+}
+
+/// Walks frames that follow one another; `frame` returns the end of the
+/// frame at a position. Skippable frames may sit between and after them.
+fn framed(
+    w: &mut Win,
+    magic: u32,
+    frame: fn(&mut Win, u64) -> Option<u64>,
+    ext: &'static str,
+) -> Option<Hit> {
+    const MAX: u64 = 64 << 30;
+    let mut pos = 0u64;
+    let mut frames = 0u32;
+    while let Some(m) = w.le32(pos) {
+        if m & 0xFFFF_FFF0 == 0x184D_2A50 && frames > 0 {
+            let Some(len) = w.le32(pos + 4) else {
+                break;
+            };
+            let next = pos + 8 + len as u64;
+            if next > w.limit() {
+                break;
+            }
+            pos = next;
+            continue;
+        }
+        if m != magic {
+            break;
+        }
+        match frame(w, pos) {
+            Some(end) => pos = end,
+            None if frames == 0 => return None,
+            None => break,
+        }
+        frames += 1;
+        if pos > MAX {
+            return None;
+        }
+    }
+    if frames == 0 {
+        return None;
+    }
+    hit(pos, ext)
+}
+
+pub fn zstd(w: &mut Win) -> Option<Hit> {
+    framed(w, 0xFD2F_B528, zstd_frame, "zst")
+}
+
+/// The xxHash32 of a short input (under 16 bytes), as used for the LZ4 header check.
+pub(crate) fn xxh32_short(data: &[u8]) -> u32 {
+    const P1: u32 = 0x9E37_79B1;
+    const P2: u32 = 0x85EB_CA77;
+    const P3: u32 = 0xC2B2_AE3D;
+    const P4: u32 = 0x27D4_EB2F;
+    const P5: u32 = 0x1656_67B1;
+    debug_assert!(data.len() < 16);
+    let mut h = P5.wrapping_add(data.len() as u32);
+    let mut words = data.chunks_exact(4);
+    for c in &mut words {
+        let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        h = h
+            .wrapping_add(v.wrapping_mul(P3))
+            .rotate_left(17)
+            .wrapping_mul(P4);
+    }
+    for b in words.remainder() {
+        h = h
+            .wrapping_add((*b as u32).wrapping_mul(P5))
+            .rotate_left(11)
+            .wrapping_mul(P1);
+    }
+    h ^= h >> 15;
+    h = h.wrapping_mul(P2);
+    h ^= h >> 13;
+    h = h.wrapping_mul(P3);
+    h ^ h >> 16
+}
+
+/// The end of one LZ4 frame that starts at `start`.
+fn lz4_frame(w: &mut Win, start: u64) -> Option<u64> {
+    let h = w.some(start + 4, 15).to_vec();
+    let (flags, block) = (*h.first()?, *h.get(1)?);
+    if flags & 0xC0 != 0x40 || flags & 0x02 != 0 || block & 0x8F != 0 || block >> 4 < 4 {
+        return None;
+    }
+    // Optional content size and dictionary id, then one byte that checks the header.
+    let content_size = if flags & 0x08 != 0 { 8 } else { 0 };
+    let descriptor = 2 + content_size + (flags & 1) as usize * 4;
+    if (xxh32_short(h.get(..descriptor)?) >> 8) as u8 != *h.get(descriptor)? {
+        return None;
+    }
+    let largest = 1u64 << (8 + 2 * (block >> 4));
+    let block_check = if flags & 0x10 != 0 { 4 } else { 0 };
+    let mut pos = start + 4 + descriptor as u64 + 1;
+    loop {
+        let v = w.le32(pos)?;
+        pos += 4;
+        if v == 0 {
+            break;
+        }
+        // The top bit marks a block stored without compression.
+        let size = (v & 0x7FFF_FFFF) as u64;
+        if size > largest {
+            return None;
+        }
+        pos += size + block_check;
+        if pos > w.limit() {
+            return None;
+        }
+    }
+    if flags & 0x04 != 0 {
+        pos += 4;
+    }
+    (pos <= w.limit()).then_some(pos)
+}
+
+pub fn lz4(w: &mut Win) -> Option<Hit> {
+    framed(w, 0x184D_2204, lz4_frame, "lz4")
+}
+
+/// `ar` archives: Debian packages and static libraries.
+pub fn ar(w: &mut Win) -> Option<Hit> {
+    const MAX: u64 = 16 << 30;
+    let mut pos = 8u64;
+    let mut members = 0u32;
+    let mut ext = "a";
+    while let Some(h) = w.get(pos, 60) {
+        if &h[58..60] != b"`\n" || !h[..58].iter().all(|c| (0x20..0x7F).contains(c)) {
+            break;
+        }
+        let digits = h[48..58].trim_ascii_end();
+        if digits.is_empty() || !digits.iter().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        let size = digits.iter().fold(0u64, |v, c| v * 10 + (c - b'0') as u64);
+        let debian = h.starts_with(b"debian-binary");
+        if pos + 60 + size > w.limit() {
+            break;
+        }
+        if members == 0 && debian {
+            ext = "deb";
+        }
+        // Members start on even offsets.
+        pos += 60 + size + (size & 1);
+        members += 1;
+        if pos > MAX {
+            return None;
+        }
+    }
+    if members == 0 {
+        return None;
+    }
+    hit(pos.min(w.limit()), ext)
+}
+
+// ------------------------------------------------------------------------------------
+// Windows system files, contacts, calendars, captures
+// ------------------------------------------------------------------------------------
+
+/// Windows registry hive: a 4096-byte header, then the hive bins.
+pub fn regf(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 512)?;
+    let mut sum = 0u32;
+    for i in 0..127 {
+        sum ^= le32(h, i * 4)?;
+    }
+    // Two values are never stored as a checksum.
+    let sum = match sum {
+        0 => 1,
+        0xFFFF_FFFF => 0xFFFF_FFFE,
+        s => s,
+    };
+    let bins = le32(h, 40)? as u64;
+    if sum != le32(h, 508)?
+        || le32(h, 20)? != 1
+        || le32(h, 24)? > 6
+        || bins == 0
+        || !bins.is_multiple_of(4096)
+    {
+        return None;
+    }
+    if w.get(4096, 4)? != b"hbin" {
+        return None;
+    }
+    hit(4096 + bins, "hve")
+}
+
+/// Windows event log: a 4096-byte header, then chunks of 64 KB.
+pub fn evtx(w: &mut Win) -> Option<Hit> {
+    const CHUNK: u64 = 65_536;
+    let h = w.get(0, 128)?;
+    let count = le16(h, 42)? as u64;
+    if &h[..8] != b"ElfFile\0"
+        || le32(h, 32)? != 128
+        || le16(h, 38)? != 3
+        || le16(h, 40)? != 4096
+        || count == 0
+        || crc32(&h[..120]) != le32(h, 124)?
+    {
+        return None;
+    }
+    let mut good = 0u64;
+    while good < count
+        && 4096 + (good + 1) * CHUNK <= w.limit()
+        && w.get(4096 + good * CHUNK, 8) == Some(b"ElfChnk\0")
+    {
+        good += 1;
+    }
+    match good {
+        0 => None,
+        g if g == count => hit(4096 + g * CHUNK, "evtx"),
+        // Fewer chunks than the header counts: the rest was overwritten.
+        g => partial(4096 + g * CHUNK, "evtx"),
+    }
+}
+
+/// Text made of objects between a BEGIN and an END line (vCard, iCalendar).
+/// Several objects may follow one another; the file ends after the last one.
+fn text_objects(w: &mut Win, begin: &[u8], end: &[u8], ext: &'static str) -> Option<Hit> {
+    const MAX: u64 = 64 << 20;
+    let extent = text_extent(w, MAX);
+    let mut pos = 0u64;
+    let mut done = 0u64;
+    while pos < extent {
+        match w.get(pos, begin.len()) {
+            Some(b) if b.eq_ignore_ascii_case(begin) => {}
+            _ => break,
+        }
+        let Some(mut e) = find_first_ci(w, pos + begin.len() as u64, extent, end) else {
+            break;
+        };
+        // Keep the line break that closes the END line.
+        let tail = w.some(e, 2);
+        if tail.starts_with(b"\r\n") {
+            e += 2;
+        } else if tail.starts_with(b"\n") {
+            e += 1;
+        }
+        done = e;
+        // Blank lines may separate one object from the next.
+        pos = e;
+        while pos < extent && matches!(w.u8(pos), Some(b'\r' | b'\n')) {
+            pos += 1;
+        }
+    }
+    if done == 0 {
+        return None;
+    }
+    hit(done, ext)
+}
+
+pub fn vcard(w: &mut Win) -> Option<Hit> {
+    text_objects(w, b"BEGIN:VCARD", b"\nEND:VCARD", "vcf")
+}
+
+pub fn icalendar(w: &mut Win) -> Option<Hit> {
+    text_objects(w, b"BEGIN:VCALENDAR", b"\nEND:VCALENDAR", "ics")
+}
+
+/// Network capture (pcap): a header, then packet records with their lengths.
+pub fn pcap(w: &mut Win) -> Option<Hit> {
+    const MAX: u64 = 64 << 30;
+    const LARGEST: u32 = 262_144;
+    let h = w.get(0, 24)?;
+    // Timestamps count micro- or nanoseconds, depending on the signature.
+    let second = match le32(h, 0)? {
+        0xA1B2_C3D4 => 1_000_000,
+        0xA1B2_3C4D => 1_000_000_000,
+        _ => return None,
+    };
+    let link = le32(h, 20)?;
+    if le16(h, 4)? != 2 || le16(h, 6)? != 4 || link & 0x03FF_0000 != 0 || link & 0xFFFF > 1024 {
+        return None;
+    }
+    let snap = match le32(h, 16)? {
+        0 => LARGEST,
+        s => s.min(LARGEST),
+    };
+    let mut pos = 24u64;
+    let mut records = 0u64;
+    while let Some(r) = w.get(pos, 16) {
+        let (fraction, stored, original) = (le32(r, 4)?, le32(r, 8)?, le32(r, 12)?);
+        if fraction >= second
+            || stored == 0
+            || stored > snap
+            || original < stored
+            || pos + 16 + stored as u64 > w.limit()
+        {
+            break;
+        }
+        pos += 16 + stored as u64;
+        records += 1;
+        if pos > MAX {
+            return None;
+        }
+    }
+    if records == 0 {
+        return None;
+    }
+    hit(pos, "pcap")
+}
+
+/// The class id that every Windows shortcut carries after its header size.
+pub const LNK_HEADER: [u8; 20] = [
+    0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x46,
+];
+
+/// Windows shortcut: a fixed header, then optional parts announced by flag bits.
+pub fn lnk(w: &mut Win) -> Option<Hit> {
+    let h = w.get(0, 76)?;
+    let flags = le32(h, 20)?;
+    if h[..20] != LNK_HEADER || h[66..76].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let mut pos = 76u64;
+    if flags & 0x01 != 0 {
+        // The target as a list of shell item ids.
+        pos += 2 + w.le16(pos)? as u64;
+    }
+    if flags & 0x02 != 0 {
+        // Where the target was: volume and path.
+        let len = w.le32(pos)? as u64;
+        if !(28..=1 << 20).contains(&len) {
+            return None;
+        }
+        pos += len;
+    }
+    // Name, relative path, working folder, arguments, icon: counted strings.
+    let wide = if flags & 0x80 != 0 { 2 } else { 1 };
+    for bit in [0x04, 0x08, 0x10, 0x20, 0x40] {
+        if flags & bit != 0 {
+            pos += 2 + w.le16(pos)? as u64 * wide;
+        }
+    }
+    // Extra blocks, closed by a size below 4.
+    for _ in 0..64 {
+        let len = w.le32(pos)? as u64;
+        if len < 4 {
+            return hit(pos + 4, "lnk");
+        }
+        if len > 1 << 20 || w.le32(pos + 4)? & 0xFFFF_FFF0 != 0xA000_0000 {
+            return None;
+        }
+        pos += len;
+    }
+    None
+}

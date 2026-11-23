@@ -23,6 +23,9 @@ struct Done {
     full: bool,
     image: Option<Decoded>,
     head: Vec<u8>,
+    /// Text taken out of the file by a format reader (documents, archives).
+    text: Option<String>,
+    caption: &'static str,
 }
 
 /// The preview of the selected file.
@@ -35,6 +38,8 @@ pub struct Full {
     pub head: Vec<u8>,
     pub text: Option<String>,
     pub hex: String,
+    /// What the preview shows when that is not obvious ("" otherwise).
+    pub caption: &'static str,
 }
 
 type Queue = Arc<(Mutex<VecDeque<Job>>, Condvar)>;
@@ -71,24 +76,48 @@ impl Previewer {
                     }
                 };
                 let ext = job.file.ext();
-                let picture =
-                    preview::is_picture(&ext) && job.file.size <= preview::MAX_PICTURE_BYTES;
+                let size = job.file.size;
+                let picture = preview::is_picture(&ext) && size <= preview::MAX_PICTURE_BYTES;
+                let embedded = preview::has_embedded_picture(&ext);
+                let mut text = None;
+                let mut caption = "";
                 let (image, head) = if job.full {
-                    let head = preview::head(&job.src, &job.file, HEAD_BYTES);
+                    let reach = if picture {
+                        size as usize
+                    } else if embedded {
+                        preview::embedded_reach(&ext, false)
+                    } else if preview::is_zip_based(&ext) {
+                        preview::ZIP_REACH
+                    } else {
+                        HEAD_BYTES
+                    };
+                    let mut all = preview::head(&job.src, &job.file, reach.max(HEAD_BYTES));
                     let image = if picture {
-                        let all = if job.file.size as usize <= head.len() {
-                            head.clone()
-                        } else {
-                            preview::head(&job.src, &job.file, job.file.size as usize)
-                        };
                         preview::decode_picture(&all, 1400)
+                    } else if embedded {
+                        let found = preview::embedded_picture(&all, 1400);
+                        if found.is_some() {
+                            caption = "The preview picture stored inside this file";
+                        }
+                        found
                     } else {
                         None
                     };
-                    (image, head)
+                    if preview::is_zip_based(&ext) {
+                        if let Some((t, c)) = preview::zip_preview(&all) {
+                            text = Some(t);
+                            caption = c;
+                        }
+                    }
+                    all.truncate(HEAD_BYTES);
+                    (image, all)
                 } else if picture {
-                    let all = preview::head(&job.src, &job.file, job.file.size as usize);
+                    let all = preview::head(&job.src, &job.file, size as usize);
                     (preview::decode_picture(&all, 180), Vec::new())
+                } else if embedded {
+                    let all =
+                        preview::head(&job.src, &job.file, preview::embedded_reach(&ext, true));
+                    (preview::embedded_picture(&all, 180), Vec::new())
                 } else {
                     (None, Vec::new())
                 };
@@ -99,6 +128,8 @@ impl Previewer {
                         full: job.full,
                         image,
                         head,
+                        text,
+                        caption,
                     })
                     .is_err()
                 {
@@ -183,6 +214,7 @@ impl Previewer {
             head: Vec::new(),
             text: None,
             hex: String::new(),
+            caption: "",
         });
         if let Some(src) = src {
             self.push(
@@ -220,7 +252,11 @@ impl Previewer {
                     full.loading = false;
                     full.texture = texture;
                     full.dims = done.image.as_ref().map(|d| d.full).unwrap_or((0, 0));
-                    full.text = preview::as_text(&done.head);
+                    full.caption = done.caption;
+                    full.text = done
+                        .text
+                        .or_else(|| preview::as_text(&done.head))
+                        .or_else(|| preview::as_legacy_text(&done.head));
                     full.hex = preview::hex_dump(&done.head, 512);
                     full.head = done.head;
                 }

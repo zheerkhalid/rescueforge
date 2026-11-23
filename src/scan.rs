@@ -7,6 +7,7 @@
 //!   records that an earlier NTFS left behind.
 
 use crate::carve::{is_text, Carver, Hit};
+pub use crate::control::ResumePoint;
 use crate::control::{Control, Progress};
 use crate::fs::{self, ntfs, AllocMap, Ctx, FsKind};
 use crate::model::{Category, Chance, Extent, FileData, FoundFile, Origin, Status};
@@ -36,6 +37,9 @@ pub struct ScanOptions {
     pub carve_off: Vec<String>,
     /// Local offset from UTC in seconds.
     pub tz: i32,
+    /// Deep scan: continue a scan that was stopped here instead of
+    /// starting the sector-by-sector pass again.
+    pub resume: Option<ResumePoint>,
 }
 
 impl Default for ScanOptions {
@@ -47,6 +51,7 @@ impl Default for ScanOptions {
             include_existing: false,
             carve_off: crate::carve::default_off(),
             tz: 0,
+            resume: None,
         }
     }
 }
@@ -80,6 +85,9 @@ struct Sink<'a> {
     carved: HashSet<u64>,
     total: u64,
     capped: bool,
+    /// A continued scan reads the file tables again to learn which space
+    /// is in use; what they list is already known and is not sent again.
+    muted: bool,
 }
 
 /// The most entries one scan lists.
@@ -87,6 +95,11 @@ pub const MAX_LISTED: u64 = 5_000_000;
 
 impl Sink<'_> {
     fn files(&mut self, mut files: Vec<FoundFile>, progress: &Progress) {
+        if self.muted {
+            self.known
+                .extend(files.iter().filter_map(|f| f.first_offset()));
+            return;
+        }
         // Memory stays bounded on enormous disks: the list is capped.
         let room = MAX_LISTED.saturating_sub(self.total) as usize;
         if files.len() > room {
@@ -123,6 +136,9 @@ impl Sink<'_> {
     }
 
     fn log(&mut self, text: String) {
+        if self.muted {
+            return;
+        }
         (self.emit)(ScanMsg::Log(text));
     }
 }
@@ -136,21 +152,38 @@ pub fn run(
     emit: &mut dyn FnMut(ScanMsg),
 ) {
     let src = src.root();
+    // Only a deep scan of the same source can be continued.
+    let resume = opts
+        .resume
+        .as_ref()
+        .filter(|r| opts.deep && r.pos <= src.len());
+    progress.set_resume(resume.cloned());
     let sink = RefCell::new(Sink {
         emit,
         known: HashSet::new(),
         carved: HashSet::new(),
-        total: 0,
+        total: resume.map(|r| r.listed).unwrap_or(0),
         capped: false,
+        muted: false,
     });
     let mut volumes: Vec<Volume> = Vec::new();
     let mut reserved: Vec<(u64, u64)> = Vec::new();
-    sink.borrow_mut().log(format!(
-        "{} of {} ({} sectors). The source is opened read-only.",
-        if opts.deep { "Deep scan" } else { "Quick scan" },
-        fmt_size(src.len()),
-        fmt_count(src.len() / 512)
-    ));
+    match resume {
+        Some(r) => {
+            sink.borrow_mut().log(format!(
+                "Continuing the deep scan at {} of {}. The source is opened read-only.",
+                fmt_size(r.pos),
+                fmt_size(src.len())
+            ));
+            sink.borrow_mut().muted = true;
+        }
+        None => sink.borrow_mut().log(format!(
+            "{} of {} ({} sectors). The source is opened read-only.",
+            if opts.deep { "Deep scan" } else { "Quick scan" },
+            fmt_size(src.len()),
+            fmt_count(src.len() / 512)
+        )),
+    }
 
     // Which file systems are there?
     let sector0 = src.read_vec(0, 512);
@@ -254,10 +287,12 @@ pub fn run(
         }
     }
 
+    sink.borrow_mut().muted = false;
     if opts.deep && !ctl.is_stopped() {
         deep(
             &src,
             opts,
+            resume,
             ctl,
             progress,
             &mut volumes,
@@ -280,6 +315,9 @@ pub fn run(
         ));
     }
     let stopped = ctl.is_stopped();
+    if !stopped {
+        progress.set_resume(None);
+    }
     progress.set_phase(if stopped { "Stopped" } else { "Finished" });
     let mut s = sink.borrow_mut();
     (s.emit)(ScanMsg::Finished { stopped });
@@ -407,6 +445,7 @@ fn locate_lost_volume(src: &Source, abs: u64, head: &[u8], known: &HashSet<u64>)
 fn deep(
     src: &Source,
     opts: &ScanOptions,
+    resume: Option<&ResumePoint>,
     ctl: &Control,
     progress: &Progress,
     volumes: &mut Vec<Volume>,
@@ -432,10 +471,26 @@ fn deep(
     let mut skip_until = 0u64;
     let mut after_text = false;
     let mut lost_count = 0u32;
+    let mut lost_starts: Vec<u64> = Vec::new();
     let mut carved_count = 0u64;
     let mut skipped = 0u64;
+    if let Some(r) = resume {
+        // Chunks are read whole: start again at the chunk that was cut short.
+        pos = (r.pos / CHUNK as u64 * CHUNK as u64).min(total);
+        skip_until = r.skip_until;
+        lost_starts = r.lost.clone();
+        lost_count = lost_starts.len() as u32;
+        vol_starts.extend(lost_starts.iter().copied());
+    }
 
     while pos < total {
+        progress.set_resume(Some(ResumePoint {
+            pos,
+            skip_until,
+            lost: lost_starts.clone(),
+            // What waits in `batch` is sent before the scan ends.
+            listed: sink.borrow().total + batch.len() as u64,
+        }));
         if ctl.checkpoint() {
             break;
         }
@@ -537,6 +592,10 @@ fn deep(
                                 reserved.extend(
                                     info.reserved.iter().map(|e| (e.offset, e.offset + e.len)),
                                 );
+                                // Only a volume that was read to the end counts as done.
+                                if !ctl.is_stopped() {
+                                    lost_starts.push(start);
+                                }
                                 volumes.push(Volume {
                                     start,
                                     len,
@@ -614,9 +673,14 @@ fn deep(
         .files(std::mem::take(&mut batch), progress);
     if !ctl.is_stopped() {
         sink.borrow_mut().log(format!(
-            "Deep scan: {} file{} recognised by content{}.",
+            "Deep scan: {} file{} recognised by content{}{}.",
             fmt_count(carved_count),
             if carved_count == 1 { "" } else { "s" },
+            if resume.is_some() {
+                " since the scan was continued"
+            } else {
+                ""
+            },
             if free_only {
                 format!(
                     " in free space ({} that is in use by existing files was skipped)",
@@ -631,9 +695,11 @@ fn deep(
     // Records that were inside the file table of a volume found later in the
     // pass are already listed by that volume.
     orphans.retain(|(abs, _)| !reserved.iter().any(|(s, e)| abs >= s && abs < e));
-    if orphans.is_empty() || ctl.is_stopped() {
+    if orphans.is_empty() {
         return;
     }
+    // A stopped scan still lists the records it has seen: they would be
+    // lost otherwise, because a continued scan does not read that part again.
     progress.set_phase("Rebuilding folders of an earlier file system");
     // Group by the volume the record lies in (usize::MAX: outside all of them).
     let mut groups: Vec<(usize, Vec<ntfs::Record>)> = Vec::new();

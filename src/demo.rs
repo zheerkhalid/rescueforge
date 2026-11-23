@@ -131,6 +131,9 @@ pub fn sources() -> Vec<DemoSource> {
     ]
 }
 
+/// The content of the Kurdish text file on the invented disk.
+const KURDISH_LETTER: &str = "مامۆستای بەڕێز،\r\nسڵاو و ڕێز. ئەم نامەیە دەنووسم بۆ ئەوەی سوپاست بکەم بۆ هەموو ئەو یارمەتییانەی لە ماوەی ئەم ساڵەدا پێشکەشت کردین. وانەکانت زۆر بەسوود بوون و هیوادارم ساڵی داهاتووش بەردەوام بیت.\r\nلەگەڵ ڕێزدا،\r\nقوتابییەکەت\r\n\r\n";
+
 /// The invented disk: an NTFS volume with a few hundred files, most of them
 /// deleted, plus files in free space that only a deep scan can find.
 pub fn disk() -> Vec<u8> {
@@ -321,6 +324,37 @@ pub fn disk() -> Vec<u8> {
     );
     files.push(
         TFile::new("Downloads/Manual.pdf", s::pdf_with(next(), 1_300_000)).at(base - 5 * day),
+    );
+    // Kurdish and Arabic names: letters must join and read right to left.
+    let kurdish = "Documents/بەڵگەنامەکان";
+    files.push(
+        TFile::new(
+            &format!("{kurdish}/ڕاپۆرتی ساڵانە ٢٠٢٥.pdf"),
+            s::pdf_with(next(), 90_000),
+        )
+        .deleted()
+        .at(base - 12 * day),
+    );
+    files.push(
+        TFile::new(
+            &format!("{kurdish}/وێنەی خێزان لە هەولێر.jpg"),
+            s::jpeg(next(), 800, 600),
+        )
+        .deleted()
+        .at(base - 11 * day),
+    );
+    files.push(
+        TFile::new(&format!("{kurdish}/تقرير المبيعات.docx"), s::docx(next()))
+            .deleted()
+            .at(base - 10 * day),
+    );
+    files.push(
+        TFile::new(
+            &format!("{kurdish}/نامە بۆ مامۆستا.txt"),
+            KURDISH_LETTER.repeat(3).into_bytes(),
+        )
+        .deleted()
+        .at(base - 8 * day),
     );
     files.push(TFile::new("readme.txt", s::txt(next(), 30)).at(base - 900 * day));
 

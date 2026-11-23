@@ -13,7 +13,7 @@ A quick scan brings back recently deleted files with their names and folders. A 
   <img alt="Platform" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=for-the-badge&logo=windows11&logoColor=white" />
   <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-B7410E?style=for-the-badge&logo=rust&logoColor=white" />
   <img alt="License" src="https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge" />
-  <img alt="EXE size" src="https://img.shields.io/badge/EXE-7.5%20MB-EA580C?style=for-the-badge" />
+  <img alt="EXE size" src="https://img.shields.io/badge/EXE-7.4%20MB-EA580C?style=for-the-badge" />
 </p>
 
 <p>
@@ -22,7 +22,7 @@ A quick scan brings back recently deleted files with their names and folders. A 
   <img alt="Read-only" src="https://img.shields.io/badge/source-opened%20read--only-10C98F?style=flat-square" />
   <img alt="Setup and portable" src="https://img.shields.io/badge/setup%20%2B%20portable-no%20runtimes-10C98F?style=flat-square" />
   <img alt="No telemetry" src="https://img.shields.io/badge/telemetry-none-10C98F?style=flat-square" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-71%20passing-10C98F?style=flat-square" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-95%20passing-10C98F?style=flat-square" />
   <img alt="Made by Zheer Khalid" src="https://img.shields.io/badge/made%20by-Zheer%20Khalid-FF5A4E?style=flat-square" />
 </p>
 
@@ -31,6 +31,7 @@ A quick scan brings back recently deleted files with their names and folders. A 
 [**Screenshots**](#%EF%B8%8F-screenshots) ·
 [**Download**](#-download) ·
 [**Limits**](#-what-recovery-can-and-cannot-do) ·
+[**Changelog**](CHANGELOG.md) ·
 [**Developer**](#-developer)
 
 <img src="docs/screenshots/results.png" alt="RescueForge results" width="900" />
@@ -47,7 +48,9 @@ A quick scan brings back recently deleted files with their names and folders. A 
 4. Try a **quick scan** first, then a **deep scan** if the files are not there.
 
 > [!NOTE]
-> **First release.** Scanning and recovery have been tested end to end on disk images, including images made by other operating systems' own formatting tools. Reading a physical drive directly needs administrator rights and has not yet been tested on real hardware. If your data matters a lot, make a disk image first (RescueForge can do it) and scan the image.
+> **Version 1.1** adds continuing a stopped deep scan, 23 more file types, previews for RAW photos and documents, and proper Kurdish and Arabic names. See the [changelog](CHANGELOG.md).
+>
+> Scanning and recovery have been tested end to end on disk images, including images made by other operating systems' own formatting tools. Reading a physical drive directly needs administrator rights and has not yet been tested on real hardware. If your data matters a lot, make a disk image first (RescueForge can do it) and scan the image.
 
 ## ✨ Features
 
@@ -67,9 +70,10 @@ A quick scan brings back recently deleted files with their names and folders. A 
 
 ### 🔬 Deep scan
 - Reads every sector and finds files by their content
-- About 45 kinds of file, with the real end of each file worked out from its structure
+- 66 kinds of file, with the real end of each file worked out from its structure
 - Finds **lost partitions** and rebuilds folders after a quick format
 - Option to search free space only, which is faster
+- **Stop and continue later**, even after closing the program
 
 </td>
 </tr>
@@ -77,20 +81,21 @@ A quick scan brings back recently deleted files with their names and folders. A 
 <td valign="top">
 
 ### 🗂️ All kinds of file
-- **Pictures:** JPEG, PNG, GIF, BMP, TIFF, WebP, HEIC, PSD, camera RAW
-- **Video and audio:** MP4, MOV, AVI, MKV, WMV, MP3, WAV, FLAC, OGG
-- **Documents:** PDF, Word, Excel, PowerPoint (new and old formats), RTF, text
-- **More:** ZIP, RAR, 7z, programs, databases, mail stores
+- **Pictures:** JPEG, PNG, GIF, BMP, TIFF, WebP, HEIC, JPEG 2000, PSD, camera RAW, icons
+- **Video and audio:** MP4, MOV, AVI, MKV, WMV, MPG, MP3, WAV, FLAC, OGG, WavPack, AMR
+- **Documents:** PDF, Word, Excel, PowerPoint (new and old formats), RTF, text, contacts, calendars
+- **More:** ZIP, RAR, 7z, Zstandard, programs, fonts, databases, mail stores, registry hives
 
 </td>
 <td valign="top">
 
 ### 🧭 Easy to navigate
 - Folder tree with original paths, tick boxes per folder
-- Filter by type, size, date and recoverability; search by name
-- List or thumbnail grid
-- **Preview** pictures, text or raw bytes before recovering
-- Running total of files and size selected
+- Filter by type, size, date and recoverability; search with words or patterns like `*.jpg`
+- List or thumbnail grid, right-click menu on every file
+- **Preview** pictures, RAW photos, the text of documents, archive contents or raw bytes
+- **Kurdish, Arabic and other right-to-left names** shown properly
+- Running total of files and size selected; export the list as a table (CSV)
 
 </td>
 </tr>
@@ -111,7 +116,7 @@ A quick scan brings back recently deleted files with their names and folders. A 
 - Refuses to recover onto the drive being scanned
 - Checks each recovered file by reading it back
 - Pause, resume and stop; use results while the scan is running
-- Save a scan and reopen it later without rescanning
+- Save a scan and reopen it later without rescanning, or continue it where it stopped
 
 </td>
 </tr>
@@ -133,6 +138,10 @@ A quick scan brings back recently deleted files with their names and folders. A 
 <td width="50%" align="center"><b>Refused: same drive</b><br><img src="docs/screenshots/recover-blocked.png" alt="Recovery blocked" /></td>
 </tr>
 <tr>
+<td width="50%" align="center"><b>Continue a stopped scan</b><br><img src="docs/screenshots/stopped.png" alt="A stopped deep scan with the Continue scan button" /></td>
+<td width="50%" align="center"><b>Kurdish and Arabic names</b><br><img src="docs/screenshots/kurdish.png" alt="Kurdish and Arabic file names and text" /></td>
+</tr>
+<tr>
 <td width="50%" align="center"><b>Disk images</b><br><img src="docs/screenshots/images.png" alt="Disk images" /></td>
 <td width="50%" align="center"><b>Light theme</b><br><img src="docs/screenshots/light-results.png" alt="Light theme" /></td>
 </tr>
@@ -148,7 +157,7 @@ Get it from the [**latest release**](https://github.com/zheerkhalid/rescueforge/
 |---|---|
 | `RescueForge-x.y.z-portable-x64.zip` | Portable: unzip and run. **Use this if the lost files were on your main drive** |
 | `RescueForge-Setup.exe` | Installer with shortcuts and an uninstaller |
-| `RescueForge.exe` | The bare 7.5 MB EXE |
+| `RescueForge.exe` | The bare 7.4 MB EXE |
 
 Windows asks for administrator rights when you start it; reading a drive directly needs them. Without them you can still scan disk image files.
 
@@ -162,6 +171,8 @@ No program can promise your files back. What decides it:
 - **Deleted files that were fragmented on FAT drives** may come back damaged.
 - **Compressed NTFS files** are listed but not decompressed; **encrypted (EFS) files** come back still encrypted.
 - **Encrypted drives** (BitLocker and similar) must be unlocked first.
+- **A continued scan** picks up the sector-by-sector pass. Folders of an earlier file system are rebuilt from each part separately, so a few of those files may show a shorter folder path than an uninterrupted scan would give.
+- **Previews of documents and RAW photos** read only the first few megabytes; a file whose text or preview picture lies further in falls back to the raw-bytes view. PDF text is not shown.
 - Not read in this version: Linux, macOS and ReFS file systems, and VHDX, VMDK or dynamic VHD images.
 
 More in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
